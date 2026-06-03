@@ -1180,46 +1180,97 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# ── TWO-COLUMN METRICS ─────────────────────────────────────────────────────────
-left_col, right_col = st.columns(2, gap="large")
+# ── 2×2 METRIC GRID ───────────────────────────────────────────────────────────
+TIER_M = {
+    "good":    {"bg":"#e8f8f7", "border":TEAL,  "hdr":DTEAL, "label":"✓ Above Network Average"},
+    "warn":    {"bg":"#fff8e1", "border":AMBER,  "hdr":AMBER, "label":"⚠ Near Network Average"},
+    "bad":     {"bg":"#fff5f5", "border":RED,    "hdr":RED,   "label":"● Below Network Average"},
+    "neutral": {"bg":"#f0faf9", "border":TEAL,   "hdr":DTEAL, "label":""},
+}
 
-with left_col:
-    # User Engagement
-    st.markdown(metric_table("User Engagement", [
-        ("Total Logins",           _n(p["logins"]),       "—"),
+def _mbox_tier(val, nav_val, higher_better=True):
+    if val is None or nav_val is None or nav_val == 0: return "neutral"
+    ratio = val / nav_val
+    if higher_better:
+        return "good" if ratio >= 0.9 else ("warn" if ratio >= 0.75 else "bad")
+    else:
+        return "good" if ratio <= 1.1 else ("warn" if ratio <= 1.25 else "bad")
+
+def _mbox(section, tier, rows, min_height=None):
+    """rows: list of (label, your_val, net_val)"""
+    s  = TIER_M[tier]
+    mh = f"min-height:{min_height};" if min_height else ""
+    status = (f"<div style='font-size:10.5px;font-weight:600;color:{s['hdr']};margin-top:2px;"
+              f"margin-bottom:8px;'>{s['label']}</div>") if s["label"] else "<div style='margin-bottom:8px;'></div>"
+    sub = (f"<div style='display:flex;padding:2px 0 4px;border-bottom:1px solid rgba(0,0,0,.1);'>"
+           f"<span style='flex:1;font-size:9.5px;color:#888;'></span>"
+           f"<span style='width:82px;text-align:center;font-size:9.5px;color:#888;'>Your Results</span>"
+           f"<span style='width:82px;text-align:center;font-size:9.5px;color:#888;'>Network Avg</span>"
+           f"</div>")
+    rows_html = ""
+    for label, yv, nv in rows:
+        rows_html += (
+            f"<div style='display:flex;align-items:center;padding:6px 0;"
+            f"border-bottom:1px solid rgba(0,0,0,.06);'>"
+            f"<span style='flex:1;font-size:12px;color:#444;'>{label}</span>"
+            f"<span style='width:82px;text-align:center;font-size:13px;"
+            f"font-weight:700;color:{s['hdr']};'>{yv}</span>"
+            f"<span style='width:82px;text-align:center;font-size:12px;color:#777;'>{nv}</span>"
+            f"</div>"
+        )
+    return (f"<div style='background:{s['bg']};border:2px solid {s['border']};"
+            f"border-radius:10px;padding:14px 16px;{mh}'>"
+            f"<div style='color:{s['hdr']};font-size:11px;font-weight:700;"
+            f"text-transform:uppercase;letter-spacing:.6px;'>{section}</div>"
+            f"{status}{sub}{rows_html}</div>")
+
+# Tier per section — drives box color
+nav_dec  = max(0, (nav.get("ffs") or 0) - (nav.get("gr") or 0))
+ap_tier  = _mbox_tier(p.get("approval_rate"), nav.get("approval_rate"), higher_better=True)
+fp_tier  = _mbox_tier(p.get("l2b"),           nav.get("l2b"),           higher_better=True)
+dq_tier2 = _mbox_tier(p.get("avg_fico_orig"), nav.get("avg_fico_orig"), higher_better=True)
+
+_MH1 = "270px"   # top row — User Engagement (2 rows) matches App Performance (5 rows)
+_MH2 = "370px"   # bottom row — Funding (4 rows) matches Deal Quality (8 rows)
+
+# Row 1
+_r1c1, _r1c2 = st.columns(2, gap="medium")
+with _r1c1:
+    st.markdown(_mbox("User Engagement", "neutral", [
+        ("Total Logins",            _n(p["logins"]),       "—"),
         ("Avg Weekly Unique Users", _n((p["unique_users"] or 0) / max(1, n_weeks), 1), "—"),
-    ]), unsafe_allow_html=True)
+    ], min_height=_MH1), unsafe_allow_html=True)
 
-    # Application Performance
-    nav_dec = (nav.get("ffs") or 0) - (nav.get("gr") or 0)
-    st.markdown(metric_table("Application Performance", [
-        ("Apps Submitted", _n(p["ffs"]),       _n(nav.get("ffs"))),
-        ("Approved",       _n(p["gr"]),        _n(nav.get("gr"))),
-        ("Declined",       _n(p["declined"]),  _n(nav_dec if nav_dec >= 0 else None)),
+with _r1c2:
+    st.markdown(_mbox("Application Performance", ap_tier, [
+        ("Apps Submitted", _n(p["ffs"]),           _n(nav.get("ffs"))),
+        ("Approved",       _n(p["gr"]),            _n(nav.get("gr"))),
+        ("Declined",       _n(p["declined"]),      _n(nav_dec or None)),
         ("Approval Rate",  _p(p["approval_rate"]), _p(nav.get("approval_rate"))),
-        ("Avg FICO at App",_n(p["avg_fico"]),  _n(nav.get("avg_fico"))),
-    ]), unsafe_allow_html=True)
+        ("Avg FICO at App",_n(p["avg_fico"]),      _n(nav.get("avg_fico"))),
+    ], min_height=_MH1), unsafe_allow_html=True)
 
-with right_col:
-    # Funding Performance
-    st.markdown(metric_table("Funding Performance", [
-        ("Funded Loans",     _n(p["ric"]),          _n(nav.get("ric"))),
-        ("Look to Book",     _p(p["l2b"]),           _p(nav.get("l2b"))),
-        ("Approve to Book",  _p(p["a2b"]),           _p(nav.get("a2b"))),
+# Row 2
+_r2c1, _r2c2 = st.columns(2, gap="medium")
+with _r2c1:
+    st.markdown(_mbox("Funding Performance", fp_tier, [
+        ("Funded Loans",     _n(p["ric"]),                 _n(nav.get("ric"))),
+        ("Look to Book",     _p(p["l2b"]),                 _p(nav.get("l2b"))),
+        ("Approve to Book",  _p(p["a2b"]),                 _p(nav.get("a2b"))),
         ("Avg Days to Fund", _n(p["avg_days_to_fund"], 1), _n(nav.get("avg_days_to_fund"), 1)),
-    ]), unsafe_allow_html=True)
+    ], min_height=_MH2), unsafe_allow_html=True)
 
-    # Deal Quality & Profitability
-    st.markdown(metric_table("Deal Quality & Profitability", [
-        ("Avg FICO (Funded)",      _n(p["avg_fico_orig"]),          _n(nav.get("avg_fico_orig"))),
-        ("Avg Amount Financed",    _d(p["avg_principal"]),          _d(nav.get("avg_principal"))),
-        ("Avg LTV",                _p(p["avg_ltv"]),                _p(nav.get("avg_ltv"))),
-        ("Avg Contract Rate (APR)",_p(p["avg_apr"]),                _p(nav.get("avg_apr"))),
-        ("Avg Buy Rate",           _p(p["avg_buy_rate"]),           _p(nav.get("avg_buy_rate"))),
-        ("Avg Reserve",            _d(p["avg_reserve"]),            _d(nav.get("avg_reserve"))),
-        ("Total Reserve Earned",   _d(p["total_reserve"]),          _d(nav.get("total_reserve"))),
-        ("Avg Back End",           _d(p["avg_be"]),                 _d(nav.get("avg_be"))),
-    ]), unsafe_allow_html=True)
+with _r2c2:
+    st.markdown(_mbox("Deal Quality & Profitability", dq_tier2, [
+        ("Avg FICO (Funded)",      _n(p["avg_fico_orig"]), _n(nav.get("avg_fico_orig"))),
+        ("Avg Amount Financed",    _d(p["avg_principal"]), _d(nav.get("avg_principal"))),
+        ("Avg LTV",                _p(p["avg_ltv"]),       _p(nav.get("avg_ltv"))),
+        ("Avg Contract Rate (APR)",_p(p["avg_apr"]),       _p(nav.get("avg_apr"))),
+        ("Avg Buy Rate",           _p(p["avg_buy_rate"]),  _p(nav.get("avg_buy_rate"))),
+        ("Avg Reserve",            _d(p["avg_reserve"]),   _d(nav.get("avg_reserve"))),
+        ("Total Reserve Earned",   _d(p["total_reserve"]), _d(nav.get("total_reserve"))),
+        ("Avg Back End",           _d(p["avg_be"]),        _d(nav.get("avg_be"))),
+    ], min_height=_MH2), unsafe_allow_html=True)
 
 
 # ── WEEK-BY-WEEK ───────────────────────────────────────────────────────────────
