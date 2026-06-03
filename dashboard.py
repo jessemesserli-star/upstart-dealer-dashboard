@@ -284,7 +284,7 @@ def get_opportunities(credit_df, dealer_id, start_dt, end_dt):
 
         # "Deal Link" column contains display text "Deal Link", not the URL — build from UUID
         uuid = str(r.get(uuid_col, "") or "").strip()
-        deal_link = f"https://autoretail.upstart.com/deals/desking/{uuid}" if uuid and uuid != "nan" else ""
+        deal_link = f"https://autoretail.upstart.com/deals/financing/{uuid}" if uuid and uuid != "nan" else ""
 
         rows_out.append({
             "Date": date_str, "Vehicle": vehicle, "FICO": fico,
