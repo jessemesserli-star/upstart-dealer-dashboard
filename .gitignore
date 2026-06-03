@@ -1,0 +1,9 @@
+# Credentials — never commit these
+*.json
+*.xlsx
+*.pdf
+*.log
+output/
+.streamlit/secrets.toml
+__pycache__/
+*.pyc

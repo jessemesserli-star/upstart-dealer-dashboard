@@ -1,0 +1,1513 @@
+"""
+Dealer Performance Dashboard — Streamlit v3
+Matches the monthly dealer-facing PDF report layout exactly.
+Two-column metrics, network rankings, week-by-week charts + table, portfolio health.
+"""
+
+import os, warnings, html as _html, urllib.parse
+warnings.filterwarnings("ignore")
+
+import streamlit as st
+import streamlit.components.v1 as components
+import pandas as pd
+import plotly.graph_objects as go
+import gspread
+from google.oauth2.service_account import Credentials
+
+# ── Sheet IDs ──────────────────────────────────────────────────────────────────
+SHEET_UAF     = "14T0ZeqKTFWK3281C52Gu_YTIUfNl3TLZUIu7qVKrb7E"
+SHEET_WOW     = "1b-k7e4DwWoHme10g9yZv1BKmYtckBHMVxfdPUuTMT58"
+SHEET_HEALTH  = "1womVzH2W-RVdrc9z5diM9iJpmgGm0ZlmJt1t7pFaohU"
+SHEET_CREDITS = "1v8Oe5WB_3sGX58RW6rJC--fR6usmPyed0gP9TFzWspI"
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+TEAL  = "#00B3A4"
+DTEAL = "#0D7A74"
+GREEN = "#388E3C"
+RED   = "#D32F2F"
+AMBER = "#F57C00"
+
+# ── DRM contacts — update phone numbers here ───────────────────────────────────
+DRM_CONTACTS = {
+    "Jamal Elzein":      {"phone": "(313) 234-3251", "email": "jamal.elzein@upstart.com"},
+    "Jessica Plaxton":   {"phone": "(919) 971-3141", "email": "jessica.plaxton@upstart.com"},
+    "Joshua Lopez":      {"phone": "(407) 864-2210", "email": "joshua.lopez@upstart.com"},
+    "Kusal Matthew":     {"phone": "(407) 259-9532", "email": "kusal.matthew@upstart.com"},
+    "Melissa Alfaro":    {"phone": "(224) 535-0215", "email": "melissa.alfaro@upstart.com"},
+    "Melissa Schlosser": {"phone": "(480) 853-7000", "email": "melissa.schlosser@upstart.com"},
+    "Miranda Pacheco":   {"phone": "(480) 531-0301", "email": "miranda.pacheco@upstart.com"},
+    "Xavier Torres":     {"phone": "(973) 965-7303", "email": "xavier.torres@upstart.com"},
+    "David Hammond":     {"phone": "(360) 888-6832", "email": "david.hammond@upstart.com"},
+}
+
+# ── Formatters ─────────────────────────────────────────────────────────────────
+def _d(v):
+    if v is None or (isinstance(v, float) and (v != v)): return "—"
+    if abs(v) >= 1_000_000: return f"${v/1_000_000:.2f}M"
+    if abs(v) >= 1_000:     return f"${v:,.0f}"
+    return f"${v:.0f}"
+
+def _p(v, dec=1):
+    if v is None or (isinstance(v, float) and (v != v)): return "—"
+    return f"{v*100:.{dec}f}%"
+
+def _n(v, dec=0):
+    if v is None or (isinstance(v, float) and (v != v)): return "—"
+    if dec == 0: return str(int(round(v)))
+    return f"{v:.{dec}f}"
+
+
+# ── Auth ───────────────────────────────────────────────────────────────────────
+def _gs_client():
+    try:
+        info = dict(st.secrets["gcp_service_account"])
+        creds = Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
+    except Exception:
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        creds_file = os.path.join(base, "DRM Reporting", "upstart-reporting-d62f862b99d3.json")
+        creds = Credentials.from_service_account_file(
+            creds_file, scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
+    return gspread.authorize(creds)
+
+
+# ── Data loading ───────────────────────────────────────────────────────────────
+_EPOCH = pd.Timestamp("1899-12-30")
+
+def _date(v):
+    try:
+        n = float(str(v))
+        return (_EPOCH + pd.Timedelta(days=int(n))) if n > 0 else pd.NaT
+    except Exception:
+        return pd.to_datetime(v, errors="coerce")
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_all_data():
+    gc = _gs_client()
+
+    # ── Funnel ───────────────────────────────────────────────────────────────
+    ws   = gc.open_by_key(SHEET_UAF).worksheet("funnel_dta")
+    rows = ws.get_all_values(value_render_option="UNFORMATTED_VALUE")
+    funnel = pd.DataFrame(rows[1:], columns=rows[0])
+    funnel["week"] = funnel["week"].apply(_date)
+    NUM_COLS = [
+        "FFS", "GR", "RIC", "FL", "Logins", "unique_users",
+        "avg_fico_score_at_pricing", "avg_fico_score_at_orig",
+        "avg_origination_principal", "avg_ltv_at_approval",
+        "avg_apr_at_orig", "avg_buy_rate_at_orig",
+        "total_reserve_at_orig", "avg_reserve_at_orig",
+        "avg_be_at_orig", "total_be_at_orig", "avg_days_to_fund",
+    ]
+    for col in NUM_COLS:
+        if col in funnel.columns:
+            funnel[col] = pd.to_numeric(funnel[col], errors="coerce").fillna(0)
+    funnel["dealer_id"] = funnel["dealer_id"].astype(str).str.strip()
+
+    # ── Dealer / DSM map ─────────────────────────────────────────────────────
+    rc_ws   = gc.open_by_key(SHEET_WOW).worksheet("Rate Checks")
+    rc_rows = rc_ws.get_all_values()
+    rc      = pd.DataFrame(rc_rows[1:], columns=rc_rows[0])
+    name_map = dict(zip(rc["Chairman Account ID"].astype(str).str.strip(),
+                        rc["Account Name"].astype(str)))
+    dsm_map  = dict(zip(rc["Chairman Account ID"].astype(str).str.strip(),
+                        rc["Account Owner"].astype(str)))
+
+    # ── Portfolio health ─────────────────────────────────────────────────────
+    try:
+        h_ws   = gc.open_by_key(SHEET_HEALTH).worksheet("output_dealer_data")
+        h_rows = h_ws.get_all_values()
+        health = pd.DataFrame(h_rows[1:], columns=h_rows[0])
+        for col in ["cumulative_loan_count", "cumulative_loans_in_FPD",
+                    "cumulative_charge_off_cnt", "cumulative_loans_in_epd"]:
+            if col in health.columns:
+                health[col] = pd.to_numeric(health[col], errors="coerce").fillna(0)
+        if "cumulative_originations" in health.columns:
+            health["cumulative_originations"] = pd.to_numeric(
+                health["cumulative_originations"].astype(str)
+                    .str.replace("$", "", regex=False).str.replace(",", ""),
+                errors="coerce").fillna(0)
+        for col in ["pct_loans_in_FPD", "pct_loans_charged_off",
+                    "pct_originations_31dpd_plus", "pct_originations_61dpd_plus"]:
+            if col in health.columns:
+                health[col] = pd.to_numeric(
+                    health[col].astype(str).str.replace("%", "", regex=False).str.strip(),
+                    errors="coerce").fillna(0) / 100.0
+        health["dealer_id"] = health["dealer_id"].astype(str).str.strip()
+    except Exception:
+        health = pd.DataFrame()
+
+    return funnel, name_map, dsm_map, health
+
+
+# ── Metric computation ─────────────────────────────────────────────────────────
+def _wavg(df, val_col, wt_col):
+    if val_col not in df.columns or wt_col not in df.columns:
+        return None
+    sub = df[(df[wt_col] > 0) & (df[val_col] > 0)]
+    if sub.empty:
+        return None
+    return (sub[val_col] * sub[wt_col]).sum() / sub[wt_col].sum()
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_credit_apps():
+    """Load individual deal-level credit applications from the Credits sheet."""
+    try:
+        gc = _gs_client()
+        ws   = gc.open_by_key(SHEET_CREDITS).worksheet("Credit Apps Approved")
+        rows = ws.get_all_values()
+        if len(rows) < 2:
+            return pd.DataFrame()
+
+        # Deduplicate column names (sheet has two "ID" and two "Finance Amount" cols)
+        seen, headers = {}, []
+        for h in rows[0]:
+            if h in seen:
+                seen[h] += 1
+                headers.append(f"{h}_{seen[h]}")
+            else:
+                seen[h] = 0
+                headers.append(h)
+
+        df = pd.DataFrame(rows[1:], columns=headers)
+        df.replace("", pd.NA, inplace=True)
+
+        # Date
+        if "Funding Form Submitted At Date" in df.columns:
+            df["Funding Form Submitted At Date"] = pd.to_datetime(
+                df["Funding Form Submitted At Date"], errors="coerce"
+            )
+
+        # Year is stored as "2,017" — strip comma before converting
+        if "Year" in df.columns:
+            df["Year"] = pd.to_numeric(
+                df["Year"].astype(str).str.replace(",", "", regex=False),
+                errors="coerce",
+            )
+
+        # APR is stored as "8.9%" — strip percent sign; value is already a percentage (8.9)
+        if "Finance Responses Apr" in df.columns:
+            df["Finance Responses Apr"] = pd.to_numeric(
+                df["Finance Responses Apr"].astype(str).str.replace("%", "", regex=False).str.strip(),
+                errors="coerce",
+            )
+
+        # Plain numeric columns (no special formatting)
+        for col in ["Fico At Pricing", "Finance Amount", "Finance Amount_1",
+                    "Initial Ltv At Pricing", "Mileage", "Term"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(
+                    df[col].astype(str).str.replace(",", "", regex=False),
+                    errors="coerce",
+                )
+
+        # Currency columns (may have "$" and commas)
+        for col in ["Vehicle Price", "Downpayment", "Net Trade Amount"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(
+                    df[col].astype(str).str.replace("$", "", regex=False)
+                                        .str.replace(",", "", regex=False).str.strip(),
+                    errors="coerce",
+                )
+
+        # Dealer ID is the 3rd column (index 2) — slug like "auffenberg-volkswagen"
+        dealer_id_col = df.columns[2]
+        df[dealer_id_col] = df[dealer_id_col].astype(str).str.strip()
+
+        # Deal UUID is the 4th column (index 3, deduplicated to "ID_1")
+        uuid_col = df.columns[3]
+        df[uuid_col] = df[uuid_col].astype(str).str.strip()
+
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def get_opportunities(credit_df, dealer_id, start_dt, end_dt):
+    """
+    Return buy-box credit apps for the dealer in the date range.
+    Buy box: FICO 620–740, APR <20%, vehicle 5–10 years old.
+    """
+    import datetime
+    if credit_df.empty:
+        return pd.DataFrame()
+
+    cur_year   = datetime.date.today().year
+    dealer_col = credit_df.columns[2]   # slug / Chairman Account ID
+    uuid_col   = credit_df.columns[3]   # deal UUID
+    date_col   = "Funding Form Submitted At Date"
+
+    df = credit_df[credit_df[dealer_col] == str(dealer_id).strip()].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    if date_col in df.columns:
+        df = df[df[date_col].notna() &
+                (df[date_col] >= start_dt) &
+                (df[date_col] <= end_dt)]
+    if df.empty:
+        return pd.DataFrame()
+
+    # Buy box: FICO 620–740, APR < 20% (stored as 8.9, not 0.089), age 5–10 yrs
+    keep = pd.Series(True, index=df.index)
+    if "Fico At Pricing" in df.columns:
+        keep &= df["Fico At Pricing"].between(620, 740)
+    if "Finance Responses Apr" in df.columns:
+        keep &= df["Finance Responses Apr"] < 20        # already a percentage value
+    if "Year" in df.columns:
+        age = cur_year - df["Year"]
+        keep &= age.between(5, 10)
+
+    result = df[keep].sort_values(date_col, ascending=False).copy()
+    if result.empty:
+        return pd.DataFrame()
+
+    rows_out = []
+    for _, r in result.iterrows():
+        dt = r.get(date_col)
+        date_str = pd.Timestamp(dt).strftime("%-m/%-d") if pd.notna(dt) else "—"
+
+        yr    = int(r["Year"])                            if pd.notna(r.get("Year"))            else ""
+        make  = str(r.get("Make",  "") or "").strip()
+        model = str(r.get("Model", "") or "").strip()
+        vehicle = f"{yr} {make} {model}".strip()
+
+        fico    = int(r["Fico At Pricing"])               if pd.notna(r.get("Fico At Pricing"))  else "—"
+        apr_raw = r.get("Finance Responses Apr")
+        apr_str = f"{apr_raw:.1f}%"                       if pd.notna(apr_raw)                   else "—"
+
+        amt = r.get("Finance Amount")
+        if pd.isna(amt):
+            amt = r.get("Finance Amount_1")
+        amount_str = f"${float(amt):,.0f}"                if pd.notna(amt)                       else "—"
+
+        # "Deal Link" column contains display text "Deal Link", not the URL — build from UUID
+        uuid = str(r.get(uuid_col, "") or "").strip()
+        deal_link = f"https://autoretail.upstart.com/deals/desking/{uuid}" if uuid and uuid != "nan" else ""
+
+        rows_out.append({
+            "Date": date_str, "Vehicle": vehicle, "FICO": fico,
+            "APR": apr_str, "Amount": amount_str, "_link": deal_link,
+        })
+
+    return pd.DataFrame(rows_out)
+
+
+def period_metrics(funnel, dealer_id, weeks):
+    df = funnel[(funnel["dealer_id"] == dealer_id) & (funnel["week"].isin(weeks))]
+    if df.empty:
+        return {k: None for k in [
+            "logins","unique_users","ffs","gr","ric","fl","declined",
+            "approval_rate","l2b","a2b","avg_fico","avg_fico_orig",
+            "avg_principal","avg_ltv","avg_apr","avg_buy_rate",
+            "avg_reserve","total_reserve","avg_be","avg_days_to_fund",
+        ]}
+    ffs = int(df["FFS"].sum())
+    gr  = int(df["GR"].sum())
+    ric = int(df["RIC"].sum())
+    fl  = int(df["FL"].sum())
+
+    total_reserve = float(df["total_reserve_at_orig"].sum()) if "total_reserve_at_orig" in df.columns else None
+    total_be      = float(df["total_be_at_orig"].sum())      if "total_be_at_orig" in df.columns else None
+
+    return {
+        "logins":       int(df["Logins"].sum()),
+        "unique_users": int(df["unique_users"].sum()) if "unique_users" in df.columns else 0,
+        "ffs":   ffs, "gr": gr, "ric": ric, "fl": fl,
+        "declined":      max(0, ffs - gr),
+        "approval_rate": gr / ffs if ffs > 0 else None,
+        "l2b":           fl / ffs if ffs > 0 else None,
+        "a2b":           fl / gr  if gr  > 0 else None,
+        "avg_fico":      _wavg(df, "avg_fico_score_at_pricing", "FFS"),
+        "avg_fico_orig": _wavg(df, "avg_fico_score_at_orig",    "FL"),
+        "avg_principal": _wavg(df, "avg_origination_principal", "FL"),
+        "avg_ltv":       _wavg(df, "avg_ltv_at_approval",       "FL"),
+        "avg_apr":       _wavg(df, "avg_apr_at_orig",            "FL"),
+        "avg_buy_rate":  _wavg(df, "avg_buy_rate_at_orig",       "FL"),
+        "avg_reserve":   total_reserve / fl if (total_reserve is not None and fl > 0) else None,
+        "total_reserve": total_reserve,
+        "avg_be":        total_be / fl if (total_be is not None and fl > 0) else None,
+        "avg_days_to_fund": _wavg(df, "avg_days_to_fund", "FL"),
+    }
+
+
+def compute_network_stats(funnel, selected_weeks):
+    df = funnel[funnel["week"].isin(selected_weeks)].copy()
+    dealer_stats = {}
+    for did in df["dealer_id"].unique():
+        m = period_metrics(funnel, did, selected_weeks)
+        if m["ffs"] and m["ffs"] > 0:
+            dealer_stats[did] = m
+
+    if not dealer_stats:
+        return {}, {}
+
+    vals = list(dealer_stats.values())
+
+    def _mean(key):
+        vs = [v[key] for v in vals if v.get(key) is not None]
+        return sum(vs) / len(vs) if vs else None
+
+    nav = {k: _mean(k) for k in [
+        "logins","ffs","gr","ric","fl","declined",
+        "approval_rate","l2b","a2b","avg_fico","avg_fico_orig",
+        "avg_principal","avg_ltv","avg_apr","avg_buy_rate",
+        "avg_reserve","total_reserve","avg_be","avg_days_to_fund",
+    ]}
+    nav["n_dealers"] = len(dealer_stats)
+    return dealer_stats, nav
+
+
+def percentile_rank(dealer_stats, metric_key, dealer_id, higher_is_better=True):
+    vals = [s[metric_key] for s in dealer_stats.values() if s.get(metric_key) is not None]
+    my_val = dealer_stats.get(dealer_id, {}).get(metric_key)
+    if not vals or my_val is None:
+        return None, None, None
+    if higher_is_better:
+        pct = sum(1 for v in vals if v < my_val) / len(vals) * 100
+    else:
+        pct = sum(1 for v in vals if v > my_val) / len(vals) * 100
+    if pct >= 50:
+        return pct, f"Top {max(1, round(100 - pct))}%", "top"
+    return pct, f"Bottom {max(1, round(pct))}%", "bottom"
+
+
+def weekly_breakdown(funnel, dealer_id, weeks):
+    df = funnel[(funnel["dealer_id"] == dealer_id) & (funnel["week"].isin(weeks))].copy()
+    df = df.sort_values("week")
+    rows = []
+    for _, r in df.iterrows():
+        ffs = int(r["FFS"])
+        gr  = int(r["GR"])
+        fl  = int(r["FL"])
+        rows.append({
+            "week":      r["week"],
+            "label":     pd.Timestamp(r["week"]).strftime("%-m/%-d"),
+            "apps":      ffs,
+            "approved":  gr,
+            "appr_rate": f"{gr/ffs:.0%}" if ffs > 0 else "0%",
+            "funded":    fl,
+            "l2b":       f"{fl/ffs:.0%}" if ffs > 0 else "0%",
+            "logins":    int(r.get("Logins", 0)),
+        })
+    return rows
+
+
+def get_health(health_df, dealer_id):
+    if health_df.empty:
+        return None
+    row = health_df[health_df["dealer_id"] == dealer_id]
+    if row.empty:
+        return None
+    r = row.iloc[0]
+    loan_count = int(r.get("cumulative_loan_count", 0) or 0)
+    fpd_count  = int(r.get("cumulative_loans_in_FPD", 0) or 0)
+    epd_count  = int(r.get("cumulative_loans_in_epd", 0) or 0)
+    co_count   = int(r.get("cumulative_charge_off_cnt", 0) or 0)
+    dpd31_pct  = float(r.get("pct_originations_31dpd_plus", 0) or 0)
+    dpd61_pct  = float(r.get("pct_originations_61dpd_plus", 0) or 0)
+    return {
+        "loan_count":   loan_count,
+        "originations": float(r.get("cumulative_originations", 0) or 0),
+        "fpd_pct":      float(r.get("pct_loans_in_FPD", 0) or 0),
+        "fpd_count":    fpd_count,
+        "epd_pct":      epd_count / loan_count if loan_count > 0 else 0.0,
+        "epd_count":    epd_count,
+        "co_pct":       float(r.get("pct_loans_charged_off", 0) or 0),
+        "co_count":     co_count,
+        "dpd31_pct":    dpd31_pct,
+        "dpd31_count":  round(dpd31_pct * loan_count),
+        "dpd61_pct":    dpd61_pct,
+        "dpd61_count":  round(dpd61_pct * loan_count),
+    }
+
+
+# ── Upstart-wide portfolio benchmarks ─────────────────────────────────────────
+# Source: total Upstart Auto portfolio as of latest reporting period.
+# FPD and CO are locked to the confirmed Upstart-wide totals.
+# Update these when the portfolio-level numbers are refreshed.
+UPSTART_FPD_BENCHMARK = 0.025    # 2.5%   First Payment Delinquency — confirmed Upstart-wide rate
+UPSTART_EPD_BENCHMARK = 0.0026   # 0.26%  Early Payment Default — confirmed Upstart-wide rate
+UPSTART_CO_BENCHMARK  = 0.0101   # 1.01%  ($6.1M charge-off / $605M originations)
+
+
+def health_benchmark(health_df):
+    """
+    FPD and CO use confirmed Upstart-wide totals (not computed from the sheet,
+    which only covers this team's dealers and would overstate both rates).
+    31+/61+ DPD are computed as a weighted aggregate from the sheet since we
+    don't have a confirmed portfolio-level figure for those.
+    """
+    bm = {
+        "fpd_pct":  UPSTART_FPD_BENCHMARK,
+        "epd_pct":  UPSTART_EPD_BENCHMARK,
+        "co_pct":   UPSTART_CO_BENCHMARK,
+        "dpd31_pct": None,
+        "dpd61_pct": None,
+    }
+    if health_df.empty:
+        return bm
+    df = health_df[health_df["cumulative_loan_count"] >= 5].copy()
+    total = df["cumulative_loan_count"].sum()
+    if total > 0:
+        if "cumulative_loans_in_epd" in df.columns:
+            bm["epd_pct"] = df["cumulative_loans_in_epd"].sum() / total
+        bm["dpd31_pct"] = (df["pct_originations_31dpd_plus"] * df["cumulative_loan_count"]).sum() / total
+        bm["dpd61_pct"] = (df["pct_originations_61dpd_plus"] * df["cumulative_loan_count"]).sum() / total
+    return bm
+
+
+def generate_opportunity(p, nav, dealer_name):
+    """Generate growth opportunity title + body matching PDF style."""
+    ric_v  = p.get("ric") or 0
+    l2b_v  = p.get("l2b")
+    fico_v = p.get("avg_fico_orig")
+    nav_l2b = nav.get("l2b")
+    nav_ric = nav.get("ric")
+
+    # Pick a title
+    if l2b_v and nav_l2b and l2b_v >= nav_l2b * 0.9:
+        title = "Good deal quality — opportunity to grow share of wallet"
+    elif ric_v == 0:
+        title = "No funded loans in this period — focus on application volume"
+    elif l2b_v and nav_l2b and l2b_v < nav_l2b * 0.7:
+        title = "Opportunity to improve deal conversion and grow funded loan volume"
+    else:
+        title = "Opportunity to increase Upstart submission volume"
+
+    # Build body sentences
+    body = []
+    if l2b_v:
+        l2b_str = f"{l2b_v:.1%}"
+        body.append(f"Look-to-book of {l2b_str} is {'solid' if l2b_v >= (nav_l2b or 0)*0.9 else 'below the network average'}.")
+    if fico_v and fico_v >= 640:
+        body.append(f"Avg funded FICO of {round(fico_v)} is within Upstart's buy box, indicating strong deal quality.")
+    if nav_ric and ric_v < nav_ric:
+        gap = round(nav_ric - ric_v, 1)
+        body.append(f"Increasing submissions from FICO 620+ customers could significantly grow funded loan volume toward the network average.")
+    if not body:
+        body.append("Contact your DRM to review strategies for growing Upstart volume at your dealership.")
+
+    return title, " ".join(body[:2])
+
+
+# ── Gmail send ────────────────────────────────────────────────────────────────
+def send_report_email(to_addr, dealer_name, dsm_name, drm_email, period_str,
+                      pdf_bytes, subject, body_text):
+    import base64, json
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    from email.mime.application import MIMEApplication
+    from googleapiclient.discovery import build
+    from google.oauth2.credentials import Credentials as OAuthCreds
+    from google.auth.transport.requests import Request
+
+    # On Streamlit Cloud use secrets; locally fall back to the token file
+    try:
+        s = st.secrets["gmail_oauth"]
+        creds = OAuthCreds(
+            token=None,
+            refresh_token=s["refresh_token"],
+            token_uri=s.get("token_uri", "https://oauth2.googleapis.com/token"),
+            client_id=s["client_id"],
+            client_secret=s["client_secret"],
+            scopes=["https://www.googleapis.com/auth/gmail.send"],
+        )
+        creds.refresh(Request())
+    except Exception:
+        token_file = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "DRM Reporting", "drive_token.json"
+        )
+        with open(token_file) as f:
+            data = json.load(f)
+        creds = OAuthCreds(
+            token=data["token"], refresh_token=data["refresh_token"],
+            token_uri=data["token_uri"], client_id=data["client_id"],
+            client_secret=data["client_secret"],
+            scopes=["https://www.googleapis.com/auth/gmail.send",
+                    "https://www.googleapis.com/auth/drive"],
+        )
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            data["token"] = creds.token
+            with open(token_file, "w") as f:
+                json.dump(data, f, indent=2)
+
+    service = build("gmail", "v1", credentials=creds)
+
+    msg = MIMEMultipart()
+    msg["To"]      = to_addr
+    msg["From"]    = drm_email
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body_text, "plain"))
+
+    pdf_part = MIMEApplication(pdf_bytes, _subtype="pdf")
+    pdf_part.add_header("Content-Disposition", "attachment",
+                        filename=f"{dealer_name.replace(' ','_')}_Upstart_Report.pdf")
+    msg.attach(pdf_part)
+
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    service.users().messages().send(userId="me", body={"raw": raw}).execute()
+
+
+# ── HTML helpers ───────────────────────────────────────────────────────────────
+def metric_table(section, rows):
+    """rows: list of (label, your_result_str, network_avg_str)"""
+    tr = ""
+    for label, yr, na in rows:
+        tr += f"""
+      <tr>
+        <td style="padding:5px 4px 5px 10px;color:#333;border-bottom:1px solid #f0f0f0;
+                   font-size:12.5px;">{label}</td>
+        <td style="padding:5px 4px;text-align:center;font-weight:700;color:#111;
+                   border-bottom:1px solid #f0f0f0;font-size:12.5px;">{yr}</td>
+        <td style="padding:5px 0 5px 4px;text-align:center;color:#777;
+                   border-bottom:1px solid #f0f0f0;font-size:12.5px;">{na}</td>
+      </tr>"""
+    return f"""
+    <table style="width:100%;border-collapse:collapse;margin-bottom:20px;table-layout:fixed;">
+      <colgroup>
+        <col style="width:58%">
+        <col style="width:21%">
+        <col style="width:21%">
+      </colgroup>
+      <tr>
+        <th style="text-align:left;color:{TEAL};font-size:11px;font-weight:700;
+                   text-transform:uppercase;letter-spacing:.6px;
+                   padding:8px 4px 5px 10px;border-bottom:2px solid {TEAL};">{section}</th>
+        <th style="text-align:center;color:#999;font-size:10px;font-weight:400;
+                   padding:8px 4px 5px;border-bottom:2px solid {TEAL};">Your Results</th>
+        <th style="text-align:center;color:#999;font-size:10px;font-weight:400;
+                   padding:8px 0 5px 4px;border-bottom:2px solid {TEAL};">Network Avg</th>
+      </tr>
+      {tr}
+    </table>"""
+
+
+def rank_badge(label, pct_label, tier):
+    if tier == "top":
+        bg, border, color = "#e8f8f7", TEAL, DTEAL
+    elif tier == "bottom":
+        bg, border, color = "#fff8f0", AMBER, AMBER
+    else:
+        bg, border, color = "#f5f5f5", "#ccc", "#999"
+    val = pct_label or "N/A"
+    return f"""
+    <div style="background:{bg};border:1px solid {border};border-radius:6px;
+                padding:12px 10px;text-align:center;flex:1;margin:0 4px;">
+      <div style="font-size:11px;font-weight:700;color:#555;text-transform:uppercase;
+                  letter-spacing:.5px;margin-bottom:5px;">{label}</div>
+      <div style="font-size:20px;font-weight:800;color:{color};">{val}</div>
+      <div style="font-size:10px;color:#888;margin-top:2px;">of Upstart network</div>
+    </div>"""
+
+
+# ── PDF generation ────────────────────────────────────────────────────────────
+def generate_dealer_pdf(dealer_name, dsm_name, drm_phone, drm_email, period_str,
+                        p, nav, dh, bm, ric_rank, res_rank, be_rank,
+                        opp_title, opp_body, wkly, n_weeks):
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.units import inch
+    from reportlab.lib import colors as rc
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Spacer, PageBreak
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+    from io import BytesIO
+    from datetime import datetime as _dt
+
+    CT  = rc.HexColor("#00B3A4")
+    CDT = rc.HexColor("#0D7A74")
+    CG  = rc.HexColor("#388E3C")
+    CR  = rc.HexColor("#D32F2F")
+    CA  = rc.HexColor("#F57C00")
+    CLG = rc.HexColor("#F5F7FA")
+    CMG = rc.HexColor("#DDDDDD")
+    CDG = rc.HexColor("#555555")
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter,
+                            leftMargin=.5*inch, rightMargin=.5*inch,
+                            topMargin=.4*inch, bottomMargin=.45*inch)
+
+    def ps(name, **kw):
+        d = dict(fontName="Helvetica", fontSize=9, leading=12, textColor=rc.black)
+        d.update(kw); return ParagraphStyle(name, **d)
+
+    # Reusable header table
+    def header_tbl():
+        t = Table([[
+            Paragraph("<font color='white'><b>UPSTART | AUTO RETAIL</b></font>",
+                      ps("hL", fontSize=15, fontName="Helvetica-Bold")),
+            Paragraph(f"<font color='white'>Dealer Performance Report<br/><b>{period_str}</b></font>",
+                      ps("hR", fontSize=9, alignment=TA_RIGHT, leading=14)),
+        ]], colWidths=[4.0*inch, 3.6*inch])
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,-1), CT),
+            ("VALIGN",     (0,0), (-1,-1), "MIDDLE"),
+            ("LEFTPADDING",(0,0), (-1,-1), 12),
+            ("RIGHTPADDING",(0,0),(-1,-1), 12),
+            ("TOPPADDING", (0,0), (-1,-1), 10),
+            ("BOTTOMPADDING",(0,0),(-1,-1), 10),
+        ]))
+        return t
+
+    def mt(section, rows, cw=None):
+        """Build a metric comparison mini-table."""
+        cw = cw or [1.95*inch, 0.72*inch, 0.72*inch]
+        hdr = [
+            Paragraph(f"<b>{section}</b>",
+                      ps(f"s{section[:4]}", fontSize=8.5, fontName="Helvetica-Bold", textColor=CT)),
+            Paragraph("<b>Your Results</b>",
+                      ps("yr", fontSize=7, textColor=rc.HexColor("#999999"), alignment=TA_RIGHT)),
+            Paragraph("<b>Network Avg</b>",
+                      ps("na", fontSize=7, textColor=rc.HexColor("#999999"), alignment=TA_RIGHT)),
+        ]
+        data = [hdr]
+        for i, (label, yr, na) in enumerate(rows):
+            data.append([
+                Paragraph(label, ps(f"l{i}", fontSize=8)),
+                Paragraph(f"<b>{yr}</b>",
+                          ps(f"r{i}", fontSize=8.5, fontName="Helvetica-Bold", alignment=TA_RIGHT)),
+                Paragraph(na, ps(f"n{i}", fontSize=8, textColor=CDG, alignment=TA_RIGHT)),
+            ])
+        tbl = Table(data, colWidths=cw)
+        cmds = [
+            ("LINEBELOW",   (0,0), (-1,0), 1.5, CT),
+            ("TOPPADDING",  (0,0), (-1,-1), 3),
+            ("BOTTOMPADDING",(0,0),(-1,-1), 3),
+            ("LEFTPADDING", (0,0), (-1,-1), 3),
+            ("RIGHTPADDING",(0,0), (-1,-1), 3),
+            ("VALIGN",      (0,0), (-1,-1), "MIDDLE"),
+        ]
+        for i in range(1, len(data)):
+            if i % 2 == 1:
+                cmds.append(("BACKGROUND", (0,i), (-1,i), CLG))
+            cmds.append(("LINEBELOW", (0,i), (-1,i), 0.3, CMG))
+        tbl.setStyle(TableStyle(cmds))
+        return tbl
+
+    story = []
+
+    # ── Page 1 ──────────────────────────────────────────────────────────────────
+    story.append(header_tbl())
+    story.append(Spacer(1, 6))
+
+    story.append(Paragraph(f"<b>{dealer_name}</b>", ps("dn", fontSize=16, fontName="Helvetica-Bold")))
+    cl = f"DSM: <b>{dsm_name}</b>"
+    if drm_phone: cl += f"  ·  {drm_phone}"
+    if drm_email: cl += f"  ·  {drm_email}"
+    story.append(Paragraph(f"<font color='#555555'>{cl}</font>", ps("dsm")))
+    story.append(Spacer(1, 8))
+
+    # Network rankings
+    story.append(Paragraph("UPSTART NETWORK RANKING",
+                           ps("nrhdr", fontSize=7.5, fontName="Helvetica-Bold",
+                              textColor=rc.HexColor("#888888"), spaceAfter=4)))
+
+    def _rbg(tier):
+        return CDT if tier == "top" else (CA if tier == "bottom" else CDG)
+
+    rk = Table([[
+        Paragraph(f"<font color='white'><b>Funded Loans</b></font><br/>"
+                  f"<font color='white' size='11'><b>{ric_rank[1] or 'N/A'}</b></font>",
+                  ps("rk1", alignment=TA_CENTER, leading=16)),
+        Paragraph(f"<font color='white'><b>Total Reserve Earned</b></font><br/>"
+                  f"<font color='white' size='11'><b>{res_rank[1] or 'N/A'}</b></font>",
+                  ps("rk2", alignment=TA_CENTER, leading=16)),
+        Paragraph(f"<font color='white'><b>Avg Back End</b></font><br/>"
+                  f"<font color='white' size='11'><b>{be_rank[1] or 'N/A'}</b></font>",
+                  ps("rk3", alignment=TA_CENTER, leading=16)),
+    ]], colWidths=[2.47*inch]*3)
+    rk.setStyle(TableStyle([
+        ("BACKGROUND",  (0,0), (0,-1), _rbg(ric_rank[2])),
+        ("BACKGROUND",  (1,0), (1,-1), _rbg(res_rank[2])),
+        ("BACKGROUND",  (2,0), (2,-1), _rbg(be_rank[2])),
+        ("ALIGN",       (0,0), (-1,-1), "CENTER"),
+        ("VALIGN",      (0,0), (-1,-1), "MIDDLE"),
+        ("TOPPADDING",  (0,0), (-1,-1), 8),
+        ("BOTTOMPADDING",(0,0),(-1,-1), 8),
+        ("LINEAFTER",   (0,0), (1,-1), 0.5, rc.white),
+    ]))
+    story.append(rk)
+    story.append(Spacer(1, 8))
+
+    # Growth opportunity
+    opp = Table([[
+        Paragraph("<font color='white'><b>Growth\nOpportunity</b></font>",
+                  ps("goL", fontSize=9, fontName="Helvetica-Bold", alignment=TA_CENTER, leading=14)),
+        [Paragraph(f"<b>{opp_title}</b>", ps("goT", fontSize=9, fontName="Helvetica-Bold")),
+         Spacer(1, 3),
+         Paragraph(opp_body, ps("goB", fontSize=8.5, textColor=CDG))],
+    ]], colWidths=[1.05*inch, 6.30*inch])
+    opp.setStyle(TableStyle([
+        ("BACKGROUND",  (0,0), (0,-1), CT),
+        ("BACKGROUND",  (1,0), (1,-1), rc.HexColor("#F0FAF9")),
+        ("VALIGN",      (0,0), (-1,-1), "MIDDLE"),
+        ("TOPPADDING",  (0,0), (-1,-1), 8),
+        ("BOTTOMPADDING",(0,0),(-1,-1), 8),
+        ("LEFTPADDING", (0,0), (0,-1), 6),
+        ("RIGHTPADDING",(0,0), (0,-1), 6),
+        ("LEFTPADDING", (1,0), (1,-1), 10),
+        ("RIGHTPADDING",(1,0), (1,-1), 8),
+        ("BOX",         (0,0), (-1,-1), 0.5, CMG),
+    ]))
+    story.append(opp)
+    story.append(Spacer(1, 10))
+
+    # Two-column metrics
+    nav_dec = max(0, (nav.get("ffs") or 0) - (nav.get("gr") or 0))
+    left_col = [
+        mt("User Engagement", [
+            ("Total Logins", _n(p["logins"]), "—"),
+            ("Avg Weekly Unique Users", _n((p["unique_users"] or 0) / max(1, n_weeks), 1), "—"),
+        ]),
+        Spacer(1, 8),
+        mt("Application Performance", [
+            ("Apps Submitted", _n(p["ffs"]),         _n(nav.get("ffs"))),
+            ("Approved",       _n(p["gr"]),           _n(nav.get("gr"))),
+            ("Declined",       _n(p["declined"]),     _n(nav_dec)),
+            ("Approval Rate",  _p(p["approval_rate"]),_p(nav.get("approval_rate"))),
+            ("Avg FICO at App",_n(p["avg_fico"]),     _n(nav.get("avg_fico"))),
+        ]),
+    ]
+    right_col = [
+        mt("Funding Performance", [
+            ("Funded Loans",    _n(p["ric"]),                   _n(nav.get("ric"))),
+            ("Look to Book",    _p(p["l2b"]),                   _p(nav.get("l2b"))),
+            ("Approve to Book", _p(p["a2b"]),                   _p(nav.get("a2b"))),
+            ("Avg Days to Fund",_n(p["avg_days_to_fund"], 1),   _n(nav.get("avg_days_to_fund"), 1)),
+        ]),
+        Spacer(1, 8),
+        mt("Deal Quality & Profitability", [
+            ("Avg FICO (Funded)",      _n(p["avg_fico_orig"]), _n(nav.get("avg_fico_orig"))),
+            ("Avg Amount Financed",    _d(p["avg_principal"]), _d(nav.get("avg_principal"))),
+            ("Avg LTV",                _p(p["avg_ltv"]),       _p(nav.get("avg_ltv"))),
+            ("Avg Contract Rate (APR)",_p(p["avg_apr"]),       _p(nav.get("avg_apr"))),
+            ("Avg Buy Rate",           _p(p["avg_buy_rate"]),  _p(nav.get("avg_buy_rate"))),
+            ("Avg Reserve",            _d(p["avg_reserve"]),   _d(nav.get("avg_reserve"))),
+            ("Total Reserve Earned",   _d(p["total_reserve"]), _d(nav.get("total_reserve"))),
+            ("Avg Back End",           _d(p["avg_be"]),        _d(nav.get("avg_be"))),
+        ]),
+    ]
+    two = Table([[left_col, right_col]], colWidths=[3.7*inch, 3.7*inch])
+    two.setStyle(TableStyle([
+        ("VALIGN",       (0,0), (-1,-1), "TOP"),
+        ("LEFTPADDING",  (0,0), (-1,-1), 0),
+        ("RIGHTPADDING", (0,0), (0,-1), 8),
+        ("TOPPADDING",   (0,0), (-1,-1), 0),
+        ("BOTTOMPADDING",(0,0), (-1,-1), 0),
+        ("LINEAFTER",    (0,0), (0,-1), 0.5, CMG),
+    ]))
+    story.append(two)
+
+    # Week-by-week table
+    if wkly:
+        story.append(Spacer(1, 10))
+        story.append(Paragraph(f"Week-by-Week — {period_str}",
+                               ps("wbw", fontSize=10, fontName="Helvetica-Bold",
+                                  textColor=CDT, spaceAfter=4)))
+        total_apps = sum(r["apps"] for r in wkly)
+        total_appr = sum(r["approved"] for r in wkly)
+        total_fund = sum(r["funded"] for r in wkly)
+        wd = [["Week","Apps","Approved","Appr. Rate","Funded","L2B"]]
+        for r in wkly:
+            wd.append([r["label"], str(r["apps"]), str(r["approved"]),
+                       r["appr_rate"], str(r["funded"]), r["l2b"]])
+        wd.append(["Total", str(total_apps), str(total_appr),
+                   f"{total_appr/total_apps:.0%}" if total_apps else "0%",
+                   str(total_fund),
+                   f"{total_fund/total_apps:.0%}" if total_apps else "0%"])
+        wt = Table(wd, colWidths=[.8*inch,.9*inch,.9*inch,1.0*inch,.9*inch,.8*inch])
+        wt.setStyle(TableStyle([
+            ("BACKGROUND",    (0,0), (-1,0), CT),
+            ("TEXTCOLOR",     (0,0), (-1,0), rc.white),
+            ("FONTNAME",      (0,0), (-1,0), "Helvetica-Bold"),
+            ("BACKGROUND",    (0,-1),(-1,-1), CT),
+            ("TEXTCOLOR",     (0,-1),(-1,-1), rc.white),
+            ("FONTNAME",      (0,-1),(-1,-1), "Helvetica-Bold"),
+            ("ALIGN",         (0,0), (-1,-1), "CENTER"),
+            ("FONTSIZE",      (0,0), (-1,-1), 8.5),
+            ("TOPPADDING",    (0,0), (-1,-1), 4),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+            ("GRID",          (0,0), (-1,-1), 0.3, CMG),
+            ("ROWBACKGROUNDS",(0,1), (-1,-2), [CLG, rc.white]),
+        ]))
+        story.append(wt)
+
+    # ── Page 2: Portfolio Health ─────────────────────────────────────────────────
+    if dh is not None:
+        story.append(PageBreak())
+        story.append(header_tbl())
+        story.append(Spacer(1, 6))
+        story.append(Paragraph(f"<b>{dealer_name}</b>",
+                               ps("ph_dn", fontSize=16, fontName="Helvetica-Bold")))
+        story.append(Paragraph("Portfolio Health — Since Launch on Upstart",
+                               ps("ph_sub", fontSize=10, fontName="Helvetica-Bold",
+                                  textColor=CDT, spaceAfter=4)))
+        story.append(Paragraph(
+            "Cumulative performance of all loans funded through Upstart since launch. "
+            "Network benchmark is a weighted average across dealers with 5+ funded loans.",
+            ps("ph_d", fontSize=8.5, textColor=CDG, spaceAfter=8)
+        ))
+
+        def phc(val, bench):
+            if not bench: return rc.black
+            r = val / bench
+            return CG if r <= 1.0 else (CA if r <= 1.5 else CR)
+
+        ph_secs = [
+            ("Portfolio Volume", [
+                ("Total Funded Loans (cumulative)", f"{dh['loan_count']:,}", "—", rc.black),
+                ("Total Originations (cumulative)",  _d(dh['originations']),  "—", rc.black),
+            ]),
+            ("Loan Performance", [
+                ("First Payment Delinquency", _p(dh['fpd_pct'],2),
+                 _p(bm.get('fpd_pct'),2), phc(dh['fpd_pct'], bm.get('fpd_pct'))),
+                ("Early Payment Default", _p(dh['epd_pct'],2),
+                 _p(bm.get('epd_pct'),2), phc(dh['epd_pct'], bm.get('epd_pct'))),
+                ("Charge-off Rate", _p(dh['co_pct'],2),
+                 _p(bm.get('co_pct'),2), phc(dh['co_pct'], bm.get('co_pct'))),
+            ]),
+            ("Delinquency", [
+                ("31+ Days Past Due Rate", _p(dh['dpd31_pct'],1),
+                 _p(bm.get('dpd31_pct'),1), phc(dh['dpd31_pct'], bm.get('dpd31_pct'))),
+                ("61+ Days Past Due Rate", _p(dh['dpd61_pct'],1),
+                 _p(bm.get('dpd61_pct'),1), phc(dh['dpd61_pct'], bm.get('dpd61_pct'))),
+            ]),
+        ]
+        for sec_name, sec_rows in ph_secs:
+            sd = [[
+                Paragraph(f"<b>{sec_name}</b>",
+                          ps(f"phs{sec_name[:3]}", fontSize=8.5, fontName="Helvetica-Bold", textColor=CT)),
+                Paragraph("<b>Your Portfolio</b>",
+                          ps("phyp", fontSize=7.5, textColor=rc.HexColor("#999999"), alignment=TA_RIGHT)),
+                Paragraph("<b>Network Avg</b>",
+                          ps("phna", fontSize=7.5, textColor=rc.HexColor("#999999"), alignment=TA_RIGHT)),
+            ]] + [
+                [Paragraph(label, ps(f"phl{i}", fontSize=8.5)),
+                 Paragraph(f"<b>{yr}</b>", ps(f"phv{i}", fontSize=9, fontName="Helvetica-Bold",
+                                               textColor=color, alignment=TA_RIGHT)),
+                 Paragraph(na, ps(f"phn{i}", fontSize=8.5, textColor=CDG, alignment=TA_RIGHT))]
+                for i, (label, yr, na, color) in enumerate(sec_rows)
+            ]
+            st_tbl = Table(sd, colWidths=[4.6*inch, 1.0*inch, 1.1*inch])
+            st_tbl.setStyle(TableStyle([
+                ("LINEBELOW",    (0,0), (-1,0), 1.5, CT),
+                ("TOPPADDING",   (0,0), (-1,-1), 4),
+                ("BOTTOMPADDING",(0,0), (-1,-1), 4),
+                ("LEFTPADDING",  (0,0), (-1,-1), 3),
+                ("RIGHTPADDING", (0,0), (-1,-1), 3),
+                ("VALIGN",       (0,0), (-1,-1), "MIDDLE"),
+                ("ROWBACKGROUNDS",(0,1),(-1,-1), [CLG, rc.white]),
+                ("LINEBELOW",    (0,1), (-1,-1), 0.3, CMG),
+            ]))
+            story.append(st_tbl)
+            story.append(Spacer(1, 6))
+
+    story.append(Spacer(1, 10))
+    story.append(Paragraph(
+        f"Generated {_dt.now().strftime('%B %d, %Y')}  ·  Confidential — For dealer use only  ·  Upstart Auto Retail",
+        ps("foot", fontSize=7.5, textColor=rc.HexColor("#AAAAAA"), alignment=TA_CENTER)
+    ))
+    doc.build(story)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+# ── Page config ────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Upstart | Dealer Performance",
+    page_icon="🌿",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(f"""
+<style>
+  /* Hide Streamlit's own header bar so our banner sits flush at the top */
+  header[data-testid="stHeader"] {{ display: none !important; }}
+  .block-container {{ padding-top: 1.2rem; padding-bottom: 2rem; }}
+
+  /* Sidebar */
+  section[data-testid="stSidebar"] > div {{ background:{DTEAL}; }}
+  section[data-testid="stSidebar"] label,
+  section[data-testid="stSidebar"] p,
+  section[data-testid="stSidebar"] span,
+  section[data-testid="stSidebar"] div {{ color:white !important; }}
+  section[data-testid="stSidebar"] .stSelectbox > div > div {{
+    background:rgba(255,255,255,0.15) !important; color:white !important;
+  }}
+
+  /* Print styles — hides sidebar, action buttons, and Streamlit chrome */
+  @media print {{
+    header[data-testid="stHeader"],
+    section[data-testid="stSidebar"],
+    [data-testid="stToolbar"],
+    .no-print {{ display: none !important; }}
+    .block-container {{ padding: 0 !important; margin: 0 !important; max-width: 100% !important; }}
+    @page {{ margin: 0.45in; size: letter; }}
+  }}
+</style>
+""", unsafe_allow_html=True)
+
+
+# ── Load data ──────────────────────────────────────────────────────────────────
+with st.spinner("Loading data…"):
+    try:
+        funnel, name_map, dsm_map, health_df = load_all_data()
+        credit_apps = load_credit_apps()
+    except Exception as e:
+        st.error(f"Could not load data: {e}")
+        st.stop()
+
+all_weeks        = sorted(funnel["week"].dropna().unique())
+week_label_list  = [pd.Timestamp(w).strftime("Week of %-m/%-d/%y") for w in all_weeks]
+
+# ── Sidebar ────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("<div style='color:white;font-size:17px;font-weight:700;margin-bottom:14px;'>"
+                "UPSTART | AUTO RETAIL</div>", unsafe_allow_html=True)
+
+    dealer_ids   = sorted(funnel["dealer_id"].dropna().unique(), key=lambda d: name_map.get(d, d))
+    display_opts = [f"{name_map.get(d, d)}  ({d})" for d in dealer_ids]
+
+    sel_disp   = st.selectbox("Dealer", display_opts)
+    sel_dealer = dealer_ids[display_opts.index(sel_disp)]
+
+    st.markdown("---")
+    st.markdown("<span style='color:white;font-weight:600;font-size:13px;'>Date Range (by Week)</span>",
+                unsafe_allow_html=True)
+
+    default_start = max(0, len(all_weeks) - 5)
+    start_lbl = st.selectbox("Start Week", week_label_list, index=default_start)
+    end_lbl   = st.selectbox("End Week",   week_label_list, index=len(all_weeks) - 1)
+
+    si = week_label_list.index(start_lbl)
+    ei = week_label_list.index(end_lbl)
+    if si > ei:
+        st.error("Start must be before end week.")
+        st.stop()
+
+    sel_weeks   = all_weeks[si : ei + 1]
+    n_weeks     = len(sel_weeks)
+    prior_weeks = all_weeks[max(0, si - n_weeks) : si]
+
+    st.markdown("---")
+    st.caption(f"{n_weeks} week(s) selected")
+    if prior_weeks:
+        st.caption(f"Prior: {week_label_list[max(0,si-n_weeks)]} → {week_label_list[si-1]}")
+
+    if st.button("🔄 Refresh Data"):
+        st.cache_data.clear()
+        st.rerun()
+    st.caption("Auto-refreshes every 30 min")
+
+
+# ── Compute ────────────────────────────────────────────────────────────────────
+p           = period_metrics(funnel, sel_dealer, sel_weeks)
+dealer_name = name_map.get(sel_dealer, sel_dealer)
+dsm_name    = dsm_map.get(sel_dealer, "—")
+drm_info    = DRM_CONTACTS.get(dsm_name, {})
+drm_phone   = drm_info.get("phone", "")
+drm_email   = drm_info.get("email", "")
+
+dealer_stats, nav = compute_network_stats(funnel, sel_weeks)
+
+ric_rank    = percentile_rank(dealer_stats, "ric",          sel_dealer, True)
+res_rank    = percentile_rank(dealer_stats, "total_reserve",sel_dealer, True)
+be_rank     = percentile_rank(dealer_stats, "avg_be",       sel_dealer, True)
+
+opp_title, opp_body = generate_opportunity(p, nav, dealer_name)
+
+wkly = weekly_breakdown(funnel, sel_dealer, sel_weeks)
+dh   = get_health(health_df, sel_dealer)
+bm   = health_benchmark(health_df)
+
+period_str = (f"{pd.Timestamp(sel_weeks[0]).strftime('%-m/%-d')} – "
+              f"{pd.Timestamp(sel_weeks[-1]).strftime('%-m/%-d/%Y')}")
+
+
+# ── HEADER ─────────────────────────────────────────────────────────────────────
+st.markdown(f"""
+<div style="background:linear-gradient(135deg,{DTEAL} 0%,{TEAL} 60%,#00c9ba 100%);
+            padding:14px 20px 12px;border-radius:8px;
+            display:flex;justify-content:space-between;align-items:center;
+            margin-bottom:4px;box-shadow:0 2px 8px rgba(0,0,0,.12);">
+  <div>
+    <span style="color:white;font-size:20px;font-weight:900;letter-spacing:.5px;">UPSTART</span>
+    <span style="color:rgba(255,255,255,.75);font-size:14px;"> | AUTO RETAIL</span>
+  </div>
+  <div style="text-align:right;">
+    <div style="color:rgba(255,255,255,.75);font-size:11px;">Dealer Performance Report</div>
+    <div style="color:white;font-size:14px;font-weight:700;">{period_str}</div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+st.markdown(f"""
+<div style="margin:6px 0 2px;">
+  <span style="font-size:22px;font-weight:800;color:#111;">{_html.escape(dealer_name)}</span>
+</div>
+<div style="font-size:13px;color:#555;margin-bottom:8px;">
+  DSM: <b>{_html.escape(dsm_name)}</b>
+  {"&nbsp;·&nbsp;" + drm_phone if drm_phone else ""}
+  {"&nbsp;·&nbsp;<a href='mailto:" + drm_email + "' style='color:" + TEAL + ";'>" + drm_email + "</a>" if drm_email else ""}
+</div>
+""", unsafe_allow_html=True)
+
+# ── ACTION BUTTONS ─────────────────────────────────────────────────────────────
+_btn_col1, _btn_col2, _spacer = st.columns([1.1, 1.5, 5], gap="small")
+
+with _btn_col1:
+    _print_clicked = st.button("🖨️  Print to PDF", use_container_width=True, key="print_btn")
+
+with _btn_col2:
+    with st.popover("📧  Send Report to Dealer", use_container_width=True):
+        st.markdown(f"**Email report to {_html.escape(dealer_name)}**")
+
+        _to_email = st.text_input("Dealer email address",
+                                  placeholder="f&i@dealership.com",
+                                  label_visibility="collapsed",
+                                  key="dealer_email_input")
+
+        st.markdown("<div style='font-size:12px;color:#555;margin:8px 0 3px;font-weight:600;'>"
+                    "Personal message (optional)</div>", unsafe_allow_html=True)
+        _personal_msg = st.text_area(
+            "personal_msg",
+            placeholder="e.g. Great speaking with you last week — here's your monthly report. "
+                        "Let me know if you'd like to connect to review.",
+            label_visibility="collapsed",
+            height=90,
+            key="personal_msg_input",
+        )
+
+        # Pre-populated signature preview
+        st.markdown(f"""
+        <div style="background:#f5f5f5;border-left:3px solid {TEAL};
+                    padding:8px 12px;border-radius:0 4px 4px 0;
+                    font-size:11.5px;color:#444;margin:8px 0 10px;line-height:1.7;">
+          <b>{_html.escape(dsm_name)}</b><br>
+          Dealer Relationship Manager · Upstart Auto Retail<br>
+          {drm_phone} · <span style="color:{TEAL};">{drm_email}</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        _send_clicked = st.button("Send Report", type="primary",
+                                  use_container_width=True, key="send_btn",
+                                  disabled=not bool(_to_email.strip()))
+
+        if _send_clicked and _to_email.strip():
+            with st.spinner("Generating PDF and sending email…"):
+                try:
+                    _pdf_bytes = generate_dealer_pdf(
+                        dealer_name, dsm_name, drm_phone, drm_email, period_str,
+                        p, nav, dh, bm, ric_rank, res_rank, be_rank,
+                        opp_title, opp_body, wkly, n_weeks,
+                    )
+                    _subject = f"Your Upstart Performance Report — {period_str}"
+
+                    # Build body: optional personal note → highlights → signature
+                    _personal_block = f"{_personal_msg.strip()}\n\n" if _personal_msg.strip() else ""
+                    _body = (
+                        f"Hi,\n\n"
+                        f"{_personal_block}"
+                        f"Please find your Upstart Dealer Performance Report attached for {period_str}.\n\n"
+                        f"Highlights:\n"
+                        f"  • Funded Loans:   {_n(p['ric'])}  (network avg {_n(nav.get('ric'))})\n"
+                        f"  • Look to Book:   {_p(p['l2b'])}  (network avg {_p(nav.get('l2b'))})\n"
+                        f"  • Approval Rate:  {_p(p['approval_rate'])}  (network avg {_p(nav.get('approval_rate'))})\n"
+                        f"  • Avg FICO:       {_n(p['avg_fico'])}  (network avg {_n(nav.get('avg_fico'))})\n"
+                        f"  • Total Reserve:  {_d(p['total_reserve'])}  (network avg {_d(nav.get('total_reserve'))})\n"
+                        f"  • Avg Back End:   {_d(p['avg_be'])}  (network avg {_d(nav.get('avg_be'))})\n\n"
+                        f"Feel free to reach out anytime.\n\n"
+                        f"--\n"
+                        f"{dsm_name}\n"
+                        f"Dealer Relationship Manager · Upstart Auto Retail\n"
+                        f"{drm_phone} · {drm_email}"
+                    )
+                    send_report_email(
+                        _to_email.strip(), dealer_name, dsm_name, drm_email,
+                        period_str, _pdf_bytes, _subject, _body,
+                    )
+                    st.success(f"✅ Report sent to {_to_email.strip()}")
+                except Exception as _e:
+                    err = str(_e)
+                    if "insufficient" in err.lower() or "scope" in err.lower() or "forbidden" in err.lower():
+                        st.error("Gmail permission not yet granted. Run this once in your terminal:\n\n"
+                                 "`python3 'setup_gmail_auth.py'`\n\nthen try again.")
+                    else:
+                        st.error(f"Send failed: {err}")
+
+if _print_clicked:
+    components.html("<script>window.parent.print();</script>", height=0)
+
+st.markdown("---")
+
+# ── NETWORK RANKINGS ───────────────────────────────────────────────────────────
+st.markdown(f"<div style='font-size:11px;font-weight:700;color:#888;text-transform:uppercase;"
+            f"letter-spacing:.8px;margin-bottom:6px;'>UPSTART NETWORK RANKING</div>",
+            unsafe_allow_html=True)
+
+st.markdown(
+    f"<div style='display:flex;gap:0;margin-bottom:14px;'>"
+    + rank_badge("Funded Loans",        ric_rank[1], ric_rank[2])
+    + rank_badge("Total Reserve Earned",res_rank[1], res_rank[2])
+    + rank_badge("Avg Back End",        be_rank[1],  be_rank[2])
+    + "</div>",
+    unsafe_allow_html=True,
+)
+
+# ── GROWTH OPPORTUNITY ─────────────────────────────────────────────────────────
+st.markdown(f"""
+<div style="display:flex;align-items:stretch;margin-bottom:18px;gap:0;
+            border:1px solid #e0e0e0;border-radius:6px;overflow:hidden;">
+  <div style="background:{TEAL};color:white;padding:12px 14px;font-size:11.5px;
+              font-weight:700;text-align:center;min-width:90px;max-width:90px;
+              display:flex;align-items:center;justify-content:center;
+              line-height:1.4;">
+    Growth<br>Opportunity
+  </div>
+  <div style="padding:12px 16px;background:white;flex:1;">
+    <div style="font-weight:700;font-size:13.5px;color:#111;margin-bottom:4px;">
+      {_html.escape(opp_title)}
+    </div>
+    <div style="font-size:13px;color:#444;line-height:1.55;">
+      {_html.escape(opp_body)}
+    </div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+# ── TWO-COLUMN METRICS ─────────────────────────────────────────────────────────
+left_col, right_col = st.columns(2, gap="large")
+
+with left_col:
+    # User Engagement
+    st.markdown(metric_table("User Engagement", [
+        ("Total Logins",           _n(p["logins"]),       "—"),
+        ("Avg Weekly Unique Users", _n((p["unique_users"] or 0) / max(1, n_weeks), 1), "—"),
+    ]), unsafe_allow_html=True)
+
+    # Application Performance
+    nav_dec = (nav.get("ffs") or 0) - (nav.get("gr") or 0)
+    st.markdown(metric_table("Application Performance", [
+        ("Apps Submitted", _n(p["ffs"]),       _n(nav.get("ffs"))),
+        ("Approved",       _n(p["gr"]),        _n(nav.get("gr"))),
+        ("Declined",       _n(p["declined"]),  _n(nav_dec if nav_dec >= 0 else None)),
+        ("Approval Rate",  _p(p["approval_rate"]), _p(nav.get("approval_rate"))),
+        ("Avg FICO at App",_n(p["avg_fico"]),  _n(nav.get("avg_fico"))),
+    ]), unsafe_allow_html=True)
+
+with right_col:
+    # Funding Performance
+    st.markdown(metric_table("Funding Performance", [
+        ("Funded Loans",     _n(p["ric"]),          _n(nav.get("ric"))),
+        ("Look to Book",     _p(p["l2b"]),           _p(nav.get("l2b"))),
+        ("Approve to Book",  _p(p["a2b"]),           _p(nav.get("a2b"))),
+        ("Avg Days to Fund", _n(p["avg_days_to_fund"], 1), _n(nav.get("avg_days_to_fund"), 1)),
+    ]), unsafe_allow_html=True)
+
+    # Deal Quality & Profitability
+    st.markdown(metric_table("Deal Quality & Profitability", [
+        ("Avg FICO (Funded)",      _n(p["avg_fico_orig"]),          _n(nav.get("avg_fico_orig"))),
+        ("Avg Amount Financed",    _d(p["avg_principal"]),          _d(nav.get("avg_principal"))),
+        ("Avg LTV",                _p(p["avg_ltv"]),                _p(nav.get("avg_ltv"))),
+        ("Avg Contract Rate (APR)",_p(p["avg_apr"]),                _p(nav.get("avg_apr"))),
+        ("Avg Buy Rate",           _p(p["avg_buy_rate"]),           _p(nav.get("avg_buy_rate"))),
+        ("Avg Reserve",            _d(p["avg_reserve"]),            _d(nav.get("avg_reserve"))),
+        ("Total Reserve Earned",   _d(p["total_reserve"]),          _d(nav.get("total_reserve"))),
+        ("Avg Back End",           _d(p["avg_be"]),                 _d(nav.get("avg_be"))),
+    ]), unsafe_allow_html=True)
+
+
+# ── WEEK-BY-WEEK ───────────────────────────────────────────────────────────────
+st.markdown(f"<div style='color:{DTEAL};font-size:13px;font-weight:700;margin:4px 0 8px;'>"
+            f"Week-by-Week — {period_str}</div>", unsafe_allow_html=True)
+
+if not wkly:
+    st.info("No weekly data for this dealer in the selected period.")
+else:
+    wk_labels = [r["label"] for r in wkly]
+
+    # Single combined chart: FFS + Funded bars, Logins line on y2
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=wk_labels, y=[r["apps"] for r in wkly],
+        name="FFS Submitted", marker_color="#80cbc4", opacity=0.85,
+    ))
+    fig.add_trace(go.Bar(
+        x=wk_labels, y=[r["funded"] for r in wkly],
+        name="Funded Loans", marker_color=TEAL,
+    ))
+    fig.add_trace(go.Scatter(
+        x=wk_labels, y=[r["logins"] for r in wkly],
+        name="Log-ins", mode="lines+markers",
+        line=dict(color=DTEAL, width=2), marker=dict(size=7),
+        yaxis="y2",
+    ))
+    fig.update_layout(
+        barmode="group", height=280,
+        margin=dict(t=20, b=20, l=0, r=0),
+        plot_bgcolor="white", paper_bgcolor="white",
+        yaxis=dict(title="FFS / Funded", gridcolor="#eee", gridwidth=1),
+        yaxis2=dict(title="Log-ins", overlaying="y", side="right", showgrid=False),
+        legend=dict(orientation="h", y=1.08, x=0, font=dict(size=11)),
+        xaxis=dict(showgrid=False),
+    )
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+    # Weekly summary table
+    total_apps = sum(r["apps"] for r in wkly)
+    total_appr = sum(r["approved"] for r in wkly)
+    total_fund = sum(r["funded"] for r in wkly)
+
+    tbl_rows = [{"Week": r["label"], "Apps": r["apps"], "Approved": r["approved"],
+                 "Appr. Rate": r["appr_rate"], "Funded": r["funded"], "L2B": r["l2b"]}
+                for r in wkly]
+    tbl_rows.append({
+        "Week": "Total",
+        "Apps": total_apps,
+        "Approved": total_appr,
+        "Appr. Rate": f"{total_appr/total_apps:.0%}" if total_apps > 0 else "0%",
+        "Funded": total_fund,
+        "L2B": f"{total_fund/total_apps:.0%}" if total_apps > 0 else "0%",
+    })
+
+    tbl_df = pd.DataFrame(tbl_rows)
+
+    # Style the Total row
+    def _style_total(row):
+        if row.name == len(tbl_df) - 1:
+            return [f"background-color:{TEAL};color:white;font-weight:700"] * len(row)
+        return [""] * len(row)
+
+    st.dataframe(
+        tbl_df.style.apply(_style_total, axis=1),
+        use_container_width=True, hide_index=True,
+    )
+
+st.markdown("---")
+
+
+# ── UPSTART OPPORTUNITIES ──────────────────────────────────────────────────────
+st.markdown(f"<div style='color:{DTEAL};font-size:13px;font-weight:700;margin-bottom:4px;'>"
+            f"Upstart Opportunities — Deals In Our Wheelhouse</div>", unsafe_allow_html=True)
+st.caption("Credit apps from this period matching Upstart's buy box (FICO 620–740, APR <20%, vehicle 5–10 years old).")
+
+opp_start = pd.Timestamp(sel_weeks[0])
+opp_end   = pd.Timestamp(sel_weeks[-1]) + pd.Timedelta(days=6)
+opp_df    = get_opportunities(credit_apps, sel_dealer, opp_start, opp_end)
+
+if opp_df.empty:
+    st.markdown("<div style='color:#666;font-size:13px;font-style:italic;'>"
+                "No opportunities matching Upstart's buy box found for this period.</div>",
+                unsafe_allow_html=True)
+else:
+    # Build HTML table with clickable View Deal links (matching PDF format)
+    opp_rows = ""
+    for i, row in opp_df.iterrows():
+        bg = "#F5F7FA" if i % 2 == 0 else "white"
+        link_cell = (f"<a href='{row['_link']}' target='_blank' "
+                     f"style='color:{TEAL};font-weight:600;text-decoration:none;'>View Deal</a>"
+                     if row["_link"] else "—")
+        opp_rows += (
+            f"<tr style='background:{bg};'>"
+            f"<td style='padding:6px 10px;'>{row['Date']}</td>"
+            f"<td style='padding:6px 10px;'>{_html.escape(str(row['Vehicle']))}</td>"
+            f"<td style='padding:6px 10px;text-align:center;'>{row['FICO']}</td>"
+            f"<td style='padding:6px 10px;text-align:center;'>{row['APR']}</td>"
+            f"<td style='padding:6px 10px;text-align:right;'>{row['Amount']}</td>"
+            f"<td style='padding:6px 10px;text-align:center;'>{link_cell}</td>"
+            f"</tr>"
+        )
+    st.markdown(f"""
+    <table style="width:100%;border-collapse:collapse;font-size:13px;margin-top:4px;">
+      <thead>
+        <tr style="background:{TEAL};">
+          <th style="padding:7px 10px;text-align:left;color:white;font-weight:600;">Date</th>
+          <th style="padding:7px 10px;text-align:left;color:white;font-weight:600;">Vehicle</th>
+          <th style="padding:7px 10px;text-align:center;color:white;font-weight:600;">FICO</th>
+          <th style="padding:7px 10px;text-align:center;color:white;font-weight:600;">APR</th>
+          <th style="padding:7px 10px;text-align:right;color:white;font-weight:600;">Amount</th>
+          <th style="padding:7px 10px;text-align:center;color:white;font-weight:600;">Link</th>
+        </tr>
+      </thead>
+      <tbody>{opp_rows}</tbody>
+    </table>
+    """, unsafe_allow_html=True)
+
+st.markdown("---")
+
+
+# ── PORTFOLIO HEALTH ───────────────────────────────────────────────────────────
+# Banner — description text fills the space inside the header, no blank gap
+st.markdown(f"""
+<div style="background:{TEAL};padding:10px 16px 10px;border-radius:6px 6px 0 0;
+            display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:0;">
+  <div>
+    <div>
+      <span style="color:white;font-size:15px;font-weight:900;">UPSTART</span>
+      <span style="color:rgba(255,255,255,.75);font-size:12px;"> | AUTO RETAIL</span>
+    </div>
+    <div style="color:rgba(255,255,255,.82);font-size:11.5px;margin-top:4px;
+                max-width:520px;line-height:1.45;">
+      Cumulative performance of all loans funded through Upstart since this dealership launched.
+      Network benchmark is a weighted average across Upstart dealers with 5+ funded loans.
+    </div>
+  </div>
+  <div style="text-align:right;flex-shrink:0;margin-left:16px;">
+    <div style="color:rgba(255,255,255,.75);font-size:10px;">Portfolio Health Report</div>
+    <div style="color:white;font-size:12px;font-weight:700;">Since Launch on Upstart</div>
+  </div>
+</div>
+<div style="border:1px solid #e0e0e0;border-top:none;border-radius:0 0 6px 6px;
+            padding:12px 16px 10px;margin-bottom:16px;">
+""", unsafe_allow_html=True)
+
+if dh is None:
+    st.info("Portfolio health data not yet available for this dealer (requires funded loan history).")
+    st.markdown("</div>", unsafe_allow_html=True)
+else:
+    # Determine box tier from worst ratio in a section
+    def _ratio(val, bench):
+        if not bench or bench == 0 or val is None: return None
+        return val / bench
+
+    def _box_tier(ratios):
+        valid = [r for r in ratios if r is not None]
+        if not valid: return "neutral"
+        worst = max(valid)
+        if worst <= 1.0: return "good"
+        if worst <= 1.5: return "warn"
+        return "bad"
+
+    TIER = {
+        "good":    {"bg":"#e8f8f7", "border":TEAL,  "hdr":DTEAL,  "label":"✓ At or Below Benchmark"},
+        "warn":    {"bg":"#fff8e1", "border":AMBER,  "hdr":AMBER,  "label":"⚠ Above Average"},
+        "bad":     {"bg":"#fff5f5", "border":RED,    "hdr":RED,    "label":"● Needs Attention"},
+        "neutral": {"bg":"#f0faf9", "border":TEAL,   "hdr":DTEAL,  "label":""},
+    }
+
+    lp_tier = _box_tier([_ratio(dh["epd_pct"], bm.get("epd_pct")),
+                          _ratio(dh["co_pct"],  bm.get("co_pct"))])
+    dq_tier = _box_tier([_ratio(dh["fpd_pct"],   bm.get("fpd_pct")),
+                          _ratio(dh["dpd31_pct"], bm.get("dpd31_pct")),
+                          _ratio(dh["dpd61_pct"], bm.get("dpd61_pct"))])
+
+    def _val_color(val, bench):
+        r = _ratio(val, bench)
+        if r is None: return "#111"
+        if r <= 1.0: return GREEN
+        if r <= 1.5: return AMBER
+        return RED
+
+    def _ph_box(section, tier, rows, show_count=False, show_network=True, min_height=None):
+        """
+        rows: list of (label, count_or_none, your_val, net_val, val_color)
+        show_count:   adds '# Loans' column left of 'Your Portfolio'
+        show_network: show/hide the Network Avg column
+        min_height:   CSS min-height string (e.g. '230px') for equal-height boxes
+        """
+        s = TIER[tier]
+        mh = f"min-height:{min_height};" if min_height else ""
+        status = (f"<div style='font-size:10.5px;font-weight:600;color:{s['hdr']};margin-top:2px;"
+                  f"margin-bottom:8px;'>{s['label']}</div>") if s["label"] else "<div style='margin-bottom:8px;'></div>"
+
+        count_hdr = (f"<span style='width:56px;text-align:center;font-size:9.5px;color:#888;'># Loans</span>"
+                     if show_count else "")
+        net_hdr   = (f"<span style='width:62px;text-align:center;font-size:9.5px;color:#888;'>Network Avg</span>"
+                     if show_network else "")
+        sub = (f"<div style='display:flex;padding:2px 0 4px;border-bottom:1px solid rgba(0,0,0,.1);'>"
+               f"<span style='flex:1;font-size:9.5px;color:#888;'></span>"
+               f"{count_hdr}"
+               f"<span style='width:62px;text-align:center;font-size:9.5px;color:#888;'>Your Portfolio</span>"
+               f"{net_hdr}"
+               f"</div>")
+
+        row_html = ""
+        for label, cnt, yv, nv, vc in rows:
+            count_cell = ""
+            if show_count:
+                count_cell = (f"<span style='width:56px;text-align:center;font-size:12px;"
+                              f"color:#555;font-weight:600;'>{cnt if cnt is not None else '—'}</span>")
+            net_cell = (f"<span style='width:62px;text-align:center;font-size:12px;color:#777;'>{nv}</span>"
+                        if show_network else "")
+            row_html += (
+                f"<div style='display:flex;align-items:center;padding:6px 0;"
+                f"border-bottom:1px solid rgba(0,0,0,.06);'>"
+                f"<span style='flex:1;font-size:12px;color:#444;'>{label}</span>"
+                f"{count_cell}"
+                f"<span style='width:62px;text-align:center;font-size:13px;"
+                f"font-weight:700;color:{vc};'>{yv}</span>"
+                f"{net_cell}"
+                f"</div>"
+            )
+        return (
+            f"<div style='background:{s['bg']};border:2px solid {s['border']};"
+            f"border-radius:10px;padding:14px 16px;{mh}'>"
+            f"<div style='color:{s['hdr']};font-size:11px;font-weight:700;"
+            f"text-transform:uppercase;letter-spacing:.6px;'>{section}</div>"
+            f"{status}{sub}{row_html}"
+            f"</div>"
+        )
+
+    # Use the same min-height on all three so boxes stay equal regardless of row count
+    _BOX_H = "230px"
+
+    ph_col1, ph_col2, ph_col3 = st.columns(3, gap="medium")
+
+    with ph_col1:
+        st.markdown(_ph_box("Portfolio Volume", "neutral", [
+            ("Total Funded Loans", None, f"{dh['loan_count']:,}", "—", "#111"),
+            ("Total Originations",  None, _d(dh["originations"]),  "—", "#111"),
+        ], show_count=False, show_network=False, min_height=_BOX_H), unsafe_allow_html=True)
+
+    with ph_col2:
+        st.markdown(_ph_box("Loan Performance", lp_tier, [
+            ("Early Payment Default",
+             dh["epd_count"],
+             _p(dh["epd_pct"], 2), _p(bm.get("epd_pct"), 2),
+             _val_color(dh["epd_pct"], bm.get("epd_pct"))),
+            ("Charge-off Rate",
+             dh["co_count"],
+             _p(dh["co_pct"],  2), _p(bm.get("co_pct"),  2),
+             _val_color(dh["co_pct"],  bm.get("co_pct"))),
+        ], show_count=True, show_network=True, min_height=_BOX_H), unsafe_allow_html=True)
+
+    with ph_col3:
+        st.markdown(_ph_box("Delinquency", dq_tier, [
+            ("First Payment Delinquency",
+             dh["fpd_count"],
+             _p(dh["fpd_pct"], 2), _p(bm.get("fpd_pct"), 2),
+             _val_color(dh["fpd_pct"], bm.get("fpd_pct"))),
+            ("31+ Days Past Due",
+             dh["dpd31_count"],
+             _p(dh["dpd31_pct"], 1), _p(bm.get("dpd31_pct"), 1),
+             _val_color(dh["dpd31_pct"], bm.get("dpd31_pct"))),
+            ("61+ Days Past Due",
+             dh["dpd61_count"],
+             _p(dh["dpd61_pct"], 1), _p(bm.get("dpd61_pct"), 1),
+             _val_color(dh["dpd61_pct"], bm.get("dpd61_pct"))),
+        ], show_count=True, show_network=True, min_height=_BOX_H), unsafe_allow_html=True)
+
+    st.markdown(
+        f"<div style='font-size:11px;color:#555;margin-top:10px;'>"
+        f"Box color = overall section performance vs network benchmark &nbsp;·&nbsp; "
+        f"<span style='color:{GREEN};font-weight:700;'>■ at/below</span> &nbsp;"
+        f"<span style='color:{AMBER};font-weight:700;'>■ up to 1.5×</span> &nbsp;"
+        f"<span style='color:{RED};font-weight:700;'>■ above 1.5×</span>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# ── Footer ─────────────────────────────────────────────────────────────────────
+from datetime import datetime
+st.markdown(
+    f"<div style='text-align:center;font-size:11px;color:#aaa;margin-top:12px;'>"
+    f"Generated {datetime.now().strftime('%B %d, %Y')} · Confidential — For dealer use only · Upstart Auto Retail"
+    f"</div>",
+    unsafe_allow_html=True,
+)
