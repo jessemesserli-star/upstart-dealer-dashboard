@@ -580,9 +580,10 @@ def send_report_email(to_addr, dealer_name, dsm_name, drm_email, period_str,
     service = build("gmail", "v1", credentials=creds)
 
     msg = MIMEMultipart()
-    msg["To"]      = to_addr
-    msg["From"]    = drm_email
-    msg["Subject"] = subject
+    msg["To"]       = to_addr
+    msg["From"]     = drm_email
+    msg["Reply-To"] = drm_email
+    msg["Subject"]  = subject
     msg.attach(MIMEText(body_text, "plain"))
 
     pdf_part = MIMEApplication(pdf_bytes, _subtype="pdf")
