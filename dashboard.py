@@ -18,7 +18,8 @@ from google.oauth2.service_account import Credentials
 SHEET_UAF     = "14T0ZeqKTFWK3281C52Gu_YTIUfNl3TLZUIu7qVKrb7E"
 SHEET_WOW     = "1b-k7e4DwWoHme10g9yZv1BKmYtckBHMVxfdPUuTMT58"
 SHEET_HEALTH  = "1womVzH2W-RVdrc9z5diM9iJpmgGm0ZlmJt1t7pFaohU"
-SHEET_CREDITS = "1v8Oe5WB_3sGX58RW6rJC--fR6usmPyed0gP9TFzWspI"
+SHEET_CREDITS  = "1v8Oe5WB_3sGX58RW6rJC--fR6usmPyed0gP9TFzWspI"
+SHEET_PASTDUE  = "1KkPVhCc-pkAXdjcxFfw1rsb_8qmfA0uTCqXaJL0bZwQ"
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 TEAL  = "#00B3A4"
@@ -222,6 +223,47 @@ def load_credit_apps():
         return df
     except Exception:
         return pd.DataFrame()
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_pastdue_loans():
+    """Load past-due (not yet charged off) loans from the past-due sheet."""
+    try:
+        gc   = _gs_client()
+        ws   = gc.open_by_key(SHEET_PASTDUE).worksheet("loans")
+        rows = ws.get_all_values()
+        if len(rows) < 2:
+            return pd.DataFrame()
+
+        # Use positional column mapping — header names in the sheet may vary
+        df = pd.DataFrame(rows[1:], columns=[
+            "chairman_id", "loan_id", "origination_date", "vin",
+            "days_past_due", "payments_made", "payments_due",
+            "first_payment_due_date", "earliest_unpaid_due_date",
+        ] + [f"_extra_{i}" for i in range(max(0, len(rows[0]) - 9))])
+
+        df["chairman_id"] = df["chairman_id"].astype(str).str.strip()
+        df["loan_id"]     = df["loan_id"].astype(str).str.strip()
+
+        for col in ("days_past_due", "payments_made", "payments_due"):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        for col in ("origination_date", "first_payment_due_date", "earliest_unpaid_due_date"):
+            df[col] = df[col].apply(_date)
+
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def get_pastdue_loans(pastdue_df, dealer_id):
+    """Return past-due loans for a single dealer, sorted worst-first."""
+    if pastdue_df.empty:
+        return pd.DataFrame()
+    df = pastdue_df[pastdue_df["chairman_id"] == str(dealer_id).strip()].copy()
+    if df.empty:
+        return pd.DataFrame()
+    return df.sort_values("days_past_due", ascending=False)
 
 
 def get_opportunities(credit_df, dealer_id, start_dt, end_dt):
@@ -957,7 +999,8 @@ st.markdown(f"""
 with st.spinner("Loading data…"):
     try:
         funnel, name_map, dsm_map, health_df = load_all_data()
-        credit_apps = load_credit_apps()
+        credit_apps   = load_credit_apps()
+        pastdue_loans = load_pastdue_loans()
     except Exception as e:
         st.error(f"Could not load data: {e}")
         st.stop()
@@ -977,17 +1020,20 @@ with st.sidebar:
     sel_dealer = dealer_ids[display_opts.index(sel_disp)]
 
     st.markdown("---")
-    st.markdown("<span style='color:white;font-weight:600;font-size:13px;'>Date Range (by Week)</span>",
+    st.markdown("<span style='color:white;font-weight:600;font-size:13px;'>Date Range</span>",
                 unsafe_allow_html=True)
 
-    default_start = max(0, len(all_weeks) - 5)
-    start_lbl = st.selectbox("Start Week", week_label_list, index=default_start)
-    end_lbl   = st.selectbox("End Week",   week_label_list, index=len(all_weeks) - 1)
+    # Start options: week-start dates; end options: corresponding week-end dates
+    start_opts = [pd.Timestamp(w).strftime("%-m/%-d/%Y") for w in all_weeks]
+    end_opts   = [(pd.Timestamp(w) + pd.Timedelta(days=6)).strftime("%-m/%-d/%Y")
+                  for w in all_weeks]
 
-    si = week_label_list.index(start_lbl)
-    ei = week_label_list.index(end_lbl)
+    default_si = max(0, len(all_weeks) - 5)
+    si = start_opts.index(st.selectbox("Start Date", start_opts, index=default_si))
+    ei = end_opts.index(st.selectbox("End Date",   end_opts,   index=len(all_weeks) - 1))
+
     if si > ei:
-        st.error("Start must be before end week.")
+        st.error("Start date must be before end date.")
         st.stop()
 
     sel_weeks   = all_weeks[si : ei + 1]
@@ -995,9 +1041,11 @@ with st.sidebar:
     prior_weeks = all_weeks[max(0, si - n_weeks) : si]
 
     st.markdown("---")
-    st.caption(f"{n_weeks} week(s) selected")
+    st.caption(f"{n_weeks} week(s)")
     if prior_weeks:
-        st.caption(f"Prior: {week_label_list[max(0,si-n_weeks)]} → {week_label_list[si-1]}")
+        _prior_start = pd.Timestamp(prior_weeks[0]).strftime("%-m/%-d")
+        _prior_end   = (pd.Timestamp(prior_weeks[-1]) + pd.Timedelta(days=6)).strftime("%-m/%-d/%Y")
+        st.caption(f"Prior: {_prior_start} → {_prior_end}")
 
     if st.button("🔄 Refresh Data"):
         st.cache_data.clear()
@@ -1026,7 +1074,7 @@ dh   = get_health(health_df, sel_dealer)
 bm   = health_benchmark(health_df)
 
 period_str = (f"{pd.Timestamp(sel_weeks[0]).strftime('%-m/%-d')} – "
-              f"{pd.Timestamp(sel_weeks[-1]).strftime('%-m/%-d/%Y')}")
+              f"{(pd.Timestamp(sel_weeks[-1]) + pd.Timedelta(days=6)).strftime('%-m/%-d/%Y')}")
 
 
 # ── HEADER ─────────────────────────────────────────────────────────────────────
@@ -1230,37 +1278,29 @@ ap_tier  = _mbox_tier(p.get("approval_rate"), nav.get("approval_rate"), higher_b
 fp_tier  = _mbox_tier(p.get("l2b"),           nav.get("l2b"),           higher_better=True)
 dq_tier2 = _mbox_tier(p.get("avg_fico_orig"), nav.get("avg_fico_orig"), higher_better=True)
 
-_MH1 = "270px"   # top row — User Engagement (2 rows) matches App Performance (5 rows)
-_MH2 = "370px"   # bottom row — Funding (4 rows) matches Deal Quality (8 rows)
+_MH = "420px"   # shared height — all 3 tiles in one row
 
-# Row 1
-_r1c1, _r1c2 = st.columns(2, gap="medium")
-with _r1c1:
-    st.markdown(_mbox("User Engagement", "neutral", [
-        ("Total Logins",            _n(p["logins"]),       "—"),
+_mc1, _mc2, _mc3 = st.columns(3, gap="medium")
+with _mc1:
+    st.markdown(_mbox("Engagement", ap_tier, [
+        ("Total Logins",            _n(p["logins"]),                                "—"),
         ("Avg Weekly Unique Users", _n((p["unique_users"] or 0) / max(1, n_weeks), 1), "—"),
-    ], min_height=_MH1), unsafe_allow_html=True)
+        ("Apps Submitted",          _n(p["ffs"]),            _n(nav.get("ffs"))),
+        ("Approved",                _n(p["gr"]),             _n(nav.get("gr"))),
+        ("Declined",                _n(p["declined"]),       _n(nav_dec or None)),
+        ("Approval Rate",           _p(p["approval_rate"]),  _p(nav.get("approval_rate"))),
+        ("Avg FICO at App",         _n(p["avg_fico"]),       _n(nav.get("avg_fico"))),
+    ], min_height=_MH), unsafe_allow_html=True)
 
-with _r1c2:
-    st.markdown(_mbox("Application Performance", ap_tier, [
-        ("Apps Submitted", _n(p["ffs"]),           _n(nav.get("ffs"))),
-        ("Approved",       _n(p["gr"]),            _n(nav.get("gr"))),
-        ("Declined",       _n(p["declined"]),      _n(nav_dec or None)),
-        ("Approval Rate",  _p(p["approval_rate"]), _p(nav.get("approval_rate"))),
-        ("Avg FICO at App",_n(p["avg_fico"]),      _n(nav.get("avg_fico"))),
-    ], min_height=_MH1), unsafe_allow_html=True)
-
-# Row 2
-_r2c1, _r2c2 = st.columns(2, gap="medium")
-with _r2c1:
+with _mc2:
     st.markdown(_mbox("Funding Performance", fp_tier, [
         ("Funded Loans",     _n(p["ric"]),                 _n(nav.get("ric"))),
         ("Look to Book",     _p(p["l2b"]),                 _p(nav.get("l2b"))),
         ("Approve to Book",  _p(p["a2b"]),                 _p(nav.get("a2b"))),
         ("Avg Days to Fund", _n(p["avg_days_to_fund"], 1), _n(nav.get("avg_days_to_fund"), 1)),
-    ], min_height=_MH2), unsafe_allow_html=True)
+    ], min_height=_MH), unsafe_allow_html=True)
 
-with _r2c2:
+with _mc3:
     st.markdown(_mbox("Deal Quality & Profitability", dq_tier2, [
         ("Avg FICO (Funded)",      _n(p["avg_fico_orig"]), _n(nav.get("avg_fico_orig"))),
         ("Avg Amount Financed",    _d(p["avg_principal"]), _d(nav.get("avg_principal"))),
@@ -1270,10 +1310,11 @@ with _r2c2:
         ("Avg Reserve",            _d(p["avg_reserve"]),   _d(nav.get("avg_reserve"))),
         ("Total Reserve Earned",   _d(p["total_reserve"]), _d(nav.get("total_reserve"))),
         ("Avg Back End",           _d(p["avg_be"]),        _d(nav.get("avg_be"))),
-    ], min_height=_MH2), unsafe_allow_html=True)
+    ], min_height=_MH), unsafe_allow_html=True)
 
 
 # ── WEEK-BY-WEEK ───────────────────────────────────────────────────────────────
+st.markdown("<div style='margin-top:24px;'></div>", unsafe_allow_html=True)
 st.markdown(f"<div style='color:{DTEAL};font-size:13px;font-weight:700;margin:4px 0 8px;'>"
             f"Week-by-Week — {period_str}</div>", unsafe_allow_html=True)
 
@@ -1314,30 +1355,46 @@ else:
     total_appr = sum(r["approved"] for r in wkly)
     total_fund = sum(r["funded"] for r in wkly)
 
-    tbl_rows = [{"Week": r["label"], "Apps": r["apps"], "Approved": r["approved"],
-                 "Appr. Rate": r["appr_rate"], "Funded": r["funded"], "L2B": r["l2b"]}
-                for r in wkly]
-    tbl_rows.append({
-        "Week": "Total",
-        "Apps": total_apps,
-        "Approved": total_appr,
-        "Appr. Rate": f"{total_appr/total_apps:.0%}" if total_apps > 0 else "0%",
-        "Funded": total_fund,
-        "L2B": f"{total_fund/total_apps:.0%}" if total_apps > 0 else "0%",
-    })
-
-    tbl_df = pd.DataFrame(tbl_rows)
-
-    # Style the Total row
-    def _style_total(row):
-        if row.name == len(tbl_df) - 1:
-            return [f"background-color:{TEAL};color:white;font-weight:700"] * len(row)
-        return [""] * len(row)
-
-    st.dataframe(
-        tbl_df.style.apply(_style_total, axis=1),
-        use_container_width=True, hide_index=True,
+    wkly_body = ""
+    for i, r in enumerate(wkly):
+        bg = "#F5F7FA" if i % 2 == 0 else "white"
+        wkly_body += (
+            f"<tr style='background:{bg};'>"
+            f"<td style='padding:7px 12px;text-align:center;'>{r['label']}</td>"
+            f"<td style='padding:7px 12px;text-align:center;'>{r['apps']}</td>"
+            f"<td style='padding:7px 12px;text-align:center;'>{r['approved']}</td>"
+            f"<td style='padding:7px 12px;text-align:center;'>{r['appr_rate']}</td>"
+            f"<td style='padding:7px 12px;text-align:center;'>{r['funded']}</td>"
+            f"<td style='padding:7px 12px;text-align:center;'>{r['l2b']}</td>"
+            f"</tr>"
+        )
+    total_appr_rate = f"{total_appr/total_apps:.0%}" if total_apps > 0 else "0%"
+    total_l2b       = f"{total_fund/total_apps:.0%}"  if total_apps > 0 else "0%"
+    wkly_body += (
+        f"<tr style='background:{TEAL};color:white;font-weight:700;'>"
+        f"<td style='padding:7px 12px;text-align:center;'>Total</td>"
+        f"<td style='padding:7px 12px;text-align:center;'>{total_apps}</td>"
+        f"<td style='padding:7px 12px;text-align:center;'>{total_appr}</td>"
+        f"<td style='padding:7px 12px;text-align:center;'>{total_appr_rate}</td>"
+        f"<td style='padding:7px 12px;text-align:center;'>{total_fund}</td>"
+        f"<td style='padding:7px 12px;text-align:center;'>{total_l2b}</td>"
+        f"</tr>"
     )
+    st.markdown(f"""
+    <table style="width:100%;border-collapse:collapse;font-size:13px;margin-top:4px;">
+      <thead>
+        <tr style="background:{TEAL};">
+          <th style="padding:7px 12px;text-align:center;color:white;font-weight:600;">Week</th>
+          <th style="padding:7px 12px;text-align:center;color:white;font-weight:600;">Apps</th>
+          <th style="padding:7px 12px;text-align:center;color:white;font-weight:600;">Approved</th>
+          <th style="padding:7px 12px;text-align:center;color:white;font-weight:600;">Appr. Rate</th>
+          <th style="padding:7px 12px;text-align:center;color:white;font-weight:600;">Funded</th>
+          <th style="padding:7px 12px;text-align:center;color:white;font-weight:600;">L2B</th>
+        </tr>
+      </thead>
+      <tbody>{wkly_body}</tbody>
+    </table>
+    """, unsafe_allow_html=True)
 
 st.markdown("---")
 
@@ -1419,6 +1476,17 @@ st.markdown(f"""
 
 if dh is None:
     st.info("Portfolio health data not yet available for this dealer (requires funded loan history).")
+
+if dh is None:
+    # Still render past due loans even without health stats
+    _pd_df_none = get_pastdue_loans(pastdue_loans, sel_dealer)
+    if not _pd_df_none.empty:
+        st.markdown(f"<div style='color:{DTEAL};font-size:12px;font-weight:700;text-transform:uppercase;"
+                    f"letter-spacing:.6px;margin-top:12px;margin-bottom:6px;'>"
+                    f"Past Due Loans — Active (Not Yet Charged Off)</div>", unsafe_allow_html=True)
+        st.dataframe(_pd_df_none[["loan_id","origination_date","vin","days_past_due",
+                                   "payments_made","payments_due","first_payment_due_date"]],
+                     use_container_width=True, hide_index=True)
     st.markdown("</div>", unsafe_allow_html=True)
 else:
     # Determine box tier from worst ratio in a section
@@ -1552,6 +1620,121 @@ else:
         f"</div>",
         unsafe_allow_html=True,
     )
+
+    # ── Past Due Loans (inside portfolio health card) ──────────────────────────
+    st.markdown(f"<div style='color:{DTEAL};font-size:12px;font-weight:700;text-transform:uppercase;"
+                f"letter-spacing:.6px;margin-top:18px;margin-bottom:6px;'>"
+                f"Past Due Loans — Active (Not Yet Charged Off)</div>", unsafe_allow_html=True)
+
+    pd_df = get_pastdue_loans(pastdue_loans, sel_dealer)
+
+    if pd_df.empty:
+        st.markdown("<div style='color:#666;font-size:13px;font-style:italic;margin-bottom:8px;'>"
+                    "No past due loans on record for this dealer.</div>", unsafe_allow_html=True)
+    else:
+        n_loans   = len(pd_df)
+        avg_dpd   = pd_df["days_past_due"].mean()
+        max_dpd   = pd_df["days_past_due"].max()
+        zero_pmts = int((pd_df["payments_made"] == 0).sum())
+
+        # Summary chips — 4 equal-width columns spanning full page width
+        _s1, _s2, _s3, _s4 = st.columns(4, gap="small")
+        with _s1:
+            st.markdown(f"""
+            <div style="background:#fff5f5;border:2px solid {RED};border-radius:8px;
+                        padding:10px 14px;text-align:center;">
+              <div style="font-size:10px;font-weight:700;color:{RED};text-transform:uppercase;
+                          letter-spacing:.5px;">Past Due Loans</div>
+              <div style="font-size:24px;font-weight:800;color:{RED};">{n_loans}</div>
+            </div>""", unsafe_allow_html=True)
+        with _s2:
+            st.markdown(f"""
+            <div style="background:#fff8f0;border:2px solid {AMBER};border-radius:8px;
+                        padding:10px 14px;text-align:center;">
+              <div style="font-size:10px;font-weight:700;color:{AMBER};text-transform:uppercase;
+                          letter-spacing:.5px;">Avg Days Past Due</div>
+              <div style="font-size:24px;font-weight:800;color:{AMBER};">{avg_dpd:.0f}</div>
+            </div>""", unsafe_allow_html=True)
+        with _s3:
+            st.markdown(f"""
+            <div style="background:#fff8f0;border:2px solid {AMBER};border-radius:8px;
+                        padding:10px 14px;text-align:center;">
+              <div style="font-size:10px;font-weight:700;color:{AMBER};text-transform:uppercase;
+                          letter-spacing:.5px;">Most Days Past Due</div>
+              <div style="font-size:24px;font-weight:800;color:{AMBER};">{int(max_dpd)}</div>
+            </div>""", unsafe_allow_html=True)
+        with _s4:
+            _z_color  = RED   if zero_pmts > 0 else TEAL
+            _z_border = RED   if zero_pmts > 0 else TEAL
+            _z_bg     = "#fff5f5" if zero_pmts > 0 else "#e8f8f7"
+            st.markdown(f"""
+            <div style="background:{_z_bg};border:2px solid {_z_border};border-radius:8px;
+                        padding:10px 14px;text-align:center;">
+              <div style="font-size:10px;font-weight:700;color:{_z_color};text-transform:uppercase;
+                          letter-spacing:.5px;">0 Payments Made</div>
+              <div style="font-size:24px;font-weight:800;color:{_z_color};">{zero_pmts}</div>
+            </div>""", unsafe_allow_html=True)
+
+        st.markdown("<div style='margin-top:10px;'></div>", unsafe_allow_html=True)
+
+        def _fmt_date(v):
+            if pd.isna(v): return "—"
+            return pd.Timestamp(v).strftime("%-m/%-d/%y")
+
+        def _dpd_color(v):
+            if pd.isna(v): return "#111"
+            if v >= 60: return RED
+            if v >= 30: return AMBER
+            return "#111"
+
+        tbl_html = ""
+        alt_i = 0  # separate counter so zero-pmt rows don't break alternation logic
+        for _, row in pd_df.iterrows():
+            zero_pmts = pd.notna(row["payments_made"]) and row["payments_made"] == 0
+            if zero_pmts:
+                bg = "#FDECEA"
+            else:
+                bg = "#F5F7FA" if alt_i % 2 == 0 else "white"
+                alt_i += 1
+
+            dpd = row["days_past_due"]
+            dpd_color = _dpd_color(dpd)
+            dpd_str   = str(int(dpd)) if pd.notna(dpd) else "—"
+            pmts      = (f"{int(row['payments_made'])}/{int(row['payments_due'])}"
+                         if pd.notna(row["payments_made"]) and pd.notna(row["payments_due"])
+                         else "—")
+            tbl_html += (
+                f"<tr style='background:{bg};'>"
+                f"<td style='padding:6px 10px;font-family:monospace;'>{_html.escape(str(row['loan_id']))}</td>"
+                f"<td style='padding:6px 10px;'>{_fmt_date(row['origination_date'])}</td>"
+                f"<td style='padding:6px 10px;font-family:monospace;'>{_html.escape(str(row['vin']))}</td>"
+                f"<td style='padding:6px 10px;text-align:center;font-weight:700;color:{dpd_color};'>{dpd_str}</td>"
+                f"<td style='padding:6px 10px;text-align:center;'>{pmts}</td>"
+                f"<td style='padding:6px 10px;'>{_fmt_date(row['first_payment_due_date'])}</td>"
+                f"</tr>"
+            )
+
+        st.markdown(f"""
+        <table style="width:100%;border-collapse:collapse;font-size:13px;margin-top:4px;">
+          <thead>
+            <tr style="background:{TEAL};">
+              <th style="padding:7px 10px;text-align:left;color:white;font-weight:600;">Loan ID</th>
+              <th style="padding:7px 10px;text-align:left;color:white;font-weight:600;">Orig. Date</th>
+              <th style="padding:7px 10px;text-align:left;color:white;font-weight:600;">VIN</th>
+              <th style="padding:7px 10px;text-align:center;color:white;font-weight:600;">Days Past Due</th>
+              <th style="padding:7px 10px;text-align:center;color:white;font-weight:600;">Pmts Made/Due</th>
+              <th style="padding:7px 10px;text-align:left;color:white;font-weight:600;">1st Pmt Due</th>
+            </tr>
+          </thead>
+          <tbody>{tbl_html}</tbody>
+        </table>
+        <div style='font-size:11px;color:#888;margin-top:6px;'>
+          <span style='display:inline-block;width:12px;height:12px;background:#FDECEA;
+                border:1px solid #f5c6cb;border-radius:2px;vertical-align:middle;margin-right:4px;'></span>
+          No payments made
+        </div>
+        """, unsafe_allow_html=True)
+
     st.markdown("</div>", unsafe_allow_html=True)
 
 # ── Footer ─────────────────────────────────────────────────────────────────────
