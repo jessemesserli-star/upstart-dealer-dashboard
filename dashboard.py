@@ -970,8 +970,14 @@ st.set_page_config(
 
 st.markdown(f"""
 <style>
-  /* Hide Streamlit's own header bar so our banner sits flush at the top */
-  header[data-testid="stHeader"] {{ display: none !important; }}
+  /* Hide Streamlit's header on desktop so our banner sits flush at the top */
+  @media (min-width: 768px) {{
+    header[data-testid="stHeader"] {{ display: none !important; }}
+  }}
+  /* On mobile keep the header visible so the sidebar hamburger button shows */
+  @media (max-width: 767px) {{
+    header[data-testid="stHeader"] {{ background: {DTEAL} !important; }}
+  }}
   .block-container {{ padding-top: 1.2rem; padding-bottom: 2rem; }}
 
   /* Sidebar */
