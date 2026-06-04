@@ -263,7 +263,7 @@ def get_pastdue_loans(pastdue_df, dealer_id):
     df = pastdue_df[pastdue_df["chairman_id"] == str(dealer_id).strip()].copy()
     if df.empty:
         return pd.DataFrame()
-    return df.sort_values("days_past_due", ascending=False)
+    return df.sort_values(["payments_made", "days_past_due"], ascending=[True, False])
 
 
 def get_opportunities(credit_df, dealer_id, start_dt, end_dt):
