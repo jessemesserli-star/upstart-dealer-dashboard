@@ -19,7 +19,7 @@ SHEET_UAF     = "14T0ZeqKTFWK3281C52Gu_YTIUfNl3TLZUIu7qVKrb7E"
 SHEET_WOW     = "1b-k7e4DwWoHme10g9yZv1BKmYtckBHMVxfdPUuTMT58"
 SHEET_HEALTH  = "1womVzH2W-RVdrc9z5diM9iJpmgGm0ZlmJt1t7pFaohU"
 SHEET_CREDITS  = "1v8Oe5WB_3sGX58RW6rJC--fR6usmPyed0gP9TFzWspI"
-SHEET_PASTDUE  = "1KkPVhCc-pkAXdjcxFfw1rsb_8qmfA0uTCqXaJL0bZwQ"
+SHEET_PASTDUE  = "1ZuN4H94EfggMz3lqlBaTo0t4BEQwAMQVxl3SH40JXSE"
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 TEAL  = "#00B3A4"
@@ -230,7 +230,7 @@ def load_pastdue_loans():
     """Load past-due (not yet charged off) loans from the past-due sheet."""
     try:
         gc   = _gs_client()
-        ws   = gc.open_by_key(SHEET_PASTDUE).worksheet("loans")
+        ws   = gc.open_by_key(SHEET_PASTDUE).worksheet("active loans missed payments")
         rows = ws.get_all_values()
         if len(rows) < 2:
             return pd.DataFrame()
