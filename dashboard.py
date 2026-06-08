@@ -230,7 +230,7 @@ def load_pastdue_loans():
     """Load past-due (not yet charged off) loans from the past-due sheet."""
     try:
         gc   = _gs_client()
-        ws   = gc.open_by_key(SHEET_PASTDUE).worksheet("active loans missed payments")
+        ws   = gc.open_by_key(SHEET_PASTDUE).worksheet("Active loans missed payments")
         rows = ws.get_all_values()
         if len(rows) < 2:
             return pd.DataFrame()
