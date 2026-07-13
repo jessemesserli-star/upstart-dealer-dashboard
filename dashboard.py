@@ -20,6 +20,9 @@ SHEET_WOW     = "1b-k7e4DwWoHme10g9yZv1BKmYtckBHMVxfdPUuTMT58"
 SHEET_HEALTH  = "1womVzH2W-RVdrc9z5diM9iJpmgGm0ZlmJt1t7pFaohU"
 SHEET_CREDITS  = "1v8Oe5WB_3sGX58RW6rJC--fR6usmPyed0gP9TFzWspI"
 SHEET_PASTDUE  = "1ZuN4H94EfggMz3lqlBaTo0t4BEQwAMQVxl3SH40JXSE"
+# Unperfected-titles sheet — 3 tabs by aging bucket; "Rooftop Slug" col maps to dealer_id.
+# NOTE: must be shared with the service account for this to load in the deployed dashboard.
+SHEET_UNPERFECTED = "16M8FCQu-BwOwZMS8mYeJMBGJKwP8qYEYRa8NcibQQoQ"
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 TEAL  = "#00B3A4"
@@ -35,7 +38,7 @@ DRM_CONTACTS = {
     "Joshua Lopez":      {"phone": "(407) 864-2210", "email": "joshua.lopez@upstart.com"},
     "Kusal Matthew":     {"phone": "(407) 259-9532", "email": "kusal.matthew@upstart.com"},
     "Melissa Alfaro":    {"phone": "(224) 535-0215", "email": "melissa.alfaro@upstart.com"},
-    "Melissa Schlosser": {"phone": "(480) 853-7000", "email": "melissa.schlosser@upstart.com"},
+    "Melissa Matyas":    {"phone": "(480) 375-1368", "email": "melissa.matyas@upstart.com"},
     "Miranda Pacheco":   {"phone": "(480) 531-0301", "email": "miranda.pacheco@upstart.com"},
     "Xavier Torres":     {"phone": "(973) 965-7303", "email": "xavier.torres@upstart.com"},
     "David Hammond":     {"phone": "(360) 888-6832", "email": "david.hammond@upstart.com"},
@@ -264,6 +267,217 @@ def get_pastdue_loans(pastdue_df, dealer_id):
     if df.empty:
         return pd.DataFrame()
     return df.sort_values(["payments_made", "days_past_due"], ascending=[True, False])
+
+
+def _norm_slug(s):
+    return str(s).strip().lower().replace("_", "-")
+
+
+def _read_unperfected_raw_sa():
+    """Read the 3 aging tabs via the service account. {bucket: rows} or {} on failure."""
+    try:
+        gc = _gs_client()
+        sh = gc.open_by_key(SHEET_UNPERFECTED)
+    except Exception:
+        return {}
+    want = {">44 days": ">44 Days", "30-44 days": "30-44 Days", "<30 days": "<30 Days"}
+    ws_by_norm = {ws.title.strip().lower(): ws for ws in sh.worksheets()}
+    out = {}
+    for norm_title, bucket in want.items():
+        ws = ws_by_norm.get(norm_title)
+        if ws is None:
+            continue
+        try:
+            out[bucket] = ws.get_all_values()
+        except Exception:
+            continue
+    return out
+
+
+def _read_unperfected_raw_oauth():
+    """Local/dev fallback: read via the signed-in user's OAuth token (the 'drive'
+    scope covers Sheets reads). Used only when the service account lacks access
+    AND a token file is present — so it no-ops in the cloud. {bucket: rows} or {}."""
+    token_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "DRM Reporting", "drive_token.json")
+    if not os.path.exists(token_path):
+        return {}
+    try:
+        import json
+        from google.oauth2.credentials import Credentials as OAuthCreds
+        from google.auth.transport.requests import Request
+        from googleapiclient.discovery import build
+        with open(token_path) as f:
+            d = json.load(f)
+        creds = OAuthCreds(
+            token=d["token"], refresh_token=d["refresh_token"],
+            token_uri=d["token_uri"], client_id=d["client_id"],
+            client_secret=d["client_secret"],
+            scopes=["https://www.googleapis.com/auth/drive"],
+        )
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        svc = build("sheets", "v4", credentials=creds)
+        out = {}
+        for tab in [">44 Days", "30-44 Days", "<30 Days"]:
+            try:
+                r = svc.spreadsheets().values().get(
+                    spreadsheetId=SHEET_UNPERFECTED, range=f"'{tab}'").execute()
+                out[tab] = r.get("values", [])
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return {}
+
+
+def _parse_unperfected(raw_by_bucket):
+    """Turn {bucket: rows} into a normalized DataFrame keyed by rooftop slug."""
+    frames = []
+    for bucket, rows in raw_by_bucket.items():
+        if not rows or len(rows) < 2:
+            continue
+        idx = {name: i for i, name in enumerate(rows[0])}
+
+        def cell(r, name):
+            i = idx.get(name)
+            return r[i].strip() if (i is not None and i < len(r) and r[i] is not None) else ""
+
+        recs = []
+        for r in rows[1:]:
+            slug = _norm_slug(cell(r, "Rooftop Slug"))
+            if not slug:
+                continue
+            amt = cell(r, "Loan Amount").replace("$", "").replace(",", "")
+            recs.append({
+                "slug":     slug,
+                "loan_id":  cell(r, "Loan ID"),
+                "vin":      cell(r, "VIN"),
+                "days":     pd.to_numeric(cell(r, "Days Unperfected"), errors="coerce"),
+                "customer": cell(r, "Customer Account Name"),
+                "orig":     cell(r, "Origination Date"),
+                "amount":   pd.to_numeric(amt, errors="coerce"),
+                "bucket":   bucket,
+            })
+        if recs:
+            frames.append(pd.DataFrame(recs))
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_unperfected_loans():
+    """Load unperfected-title loans from all 3 aging tabs, keyed by rooftop slug.
+    Tries the service account first; falls back to the local OAuth token when the
+    service account can't reach the sheet. Empty DataFrame if neither works."""
+    df = _parse_unperfected(_read_unperfected_raw_sa())
+    if df.empty:
+        df = _parse_unperfected(_read_unperfected_raw_oauth())
+    return df
+
+
+def get_unperfected_loans(unp_df, dealer_id):
+    """Return unperfected-title loans for a single dealer, oldest-first."""
+    if unp_df is None or unp_df.empty:
+        return pd.DataFrame()
+    df = unp_df[unp_df["slug"] == _norm_slug(dealer_id)].copy()
+    if df.empty:
+        return df
+    return df.sort_values("days", ascending=False)
+
+
+def render_unperfected_section(unp_df, dealer_id):
+    """Render the Unperfected Titles block (3 aging-bucket metric chips + a
+    deal list sorted oldest-first) inside the portfolio-health card."""
+    st.markdown(f"<div style='color:{DTEAL};font-size:12px;font-weight:700;text-transform:uppercase;"
+                f"letter-spacing:.6px;margin-top:18px;margin-bottom:6px;'>"
+                f"Unperfected Titles</div>", unsafe_allow_html=True)
+
+    st.markdown(
+        f"<div style='background:#fff8f0;border-left:3px solid {AMBER};padding:8px 12px;"
+        f"font-size:12px;color:#7a4a00;margin-bottom:10px;border-radius:0 4px 4px 0;line-height:1.45;'>"
+        f"<b>Unperfected titles over 45 days old are subject to buyback per Upstart's "
+        f"Dealer Agreement.</b> Please ensure all titles are processed in a timely manner "
+        f"to avoid buybacks or disruption to your Upstart Account.</div>",
+        unsafe_allow_html=True,
+    )
+
+    # If the full dataset is empty, the source sheet is unreachable (not shared
+    # with the service account) — show an explicit note rather than a false
+    # "all clear", which would otherwise appear for every dealer.
+    if unp_df is None or unp_df.empty:
+        st.info("Unperfected-title data is currently unavailable — the source sheet "
+                "is not shared with the dashboard's service account yet.")
+        return
+
+    u_df = get_unperfected_loans(unp_df, dealer_id)
+
+    # (display_label, data bucket key, color, bg)
+    BUCKETS = [
+        (">44 Days",    ">44 Days",   RED,   "#fff5f5"),
+        ("30–44 Days",  "30-44 Days", AMBER, "#fff8f0"),
+        ("&lt;30 Days", "<30 Days",   TEAL,  "#e8f8f7"),
+    ]
+    cols = st.columns(3, gap="small")
+    for (label, key, color, bg), col in zip(BUCKETS, cols):
+        if u_df.empty:
+            cnt, amt = 0, 0
+        else:
+            sub = u_df[u_df["bucket"] == key]
+            cnt, amt = len(sub), sub["amount"].fillna(0).sum()
+        with col:
+            st.markdown(f"""
+            <div style="background:{bg};border:2px solid {color};border-radius:8px;
+                        padding:10px 14px;text-align:center;">
+              <div style="font-size:10px;font-weight:700;color:{color};text-transform:uppercase;
+                          letter-spacing:.5px;">{label}</div>
+              <div style="font-size:24px;font-weight:800;color:{color};">{cnt}</div>
+              <div style="font-size:11px;color:{color};">${amt:,.0f} at risk</div>
+            </div>""", unsafe_allow_html=True)
+
+    st.markdown("<div style='margin-top:10px;'></div>", unsafe_allow_html=True)
+
+    if u_df.empty:
+        st.markdown(f"<div style='color:{GREEN};font-size:13px;font-weight:700;margin-bottom:8px;'>"
+                    f"✓ No unperfected titles for this dealer.</div>", unsafe_allow_html=True)
+        return
+
+    BCOLOR = {">44 Days": RED, "30-44 Days": AMBER, "<30 Days": TEAL}
+
+    def _fmt_amt(v):
+        return f"${v:,.0f}" if pd.notna(v) else "—"
+
+    rows_html, alt_i = "", 0
+    for _, row in u_df.iterrows():
+        bg = "#F5F7FA" if alt_i % 2 == 0 else "white"
+        alt_i += 1
+        dcol = BCOLOR.get(row["bucket"], "#111")
+        days = "—" if pd.isna(row["days"]) else str(int(row["days"]))
+        rows_html += (
+            f"<tr style='background:{bg};'>"
+            f"<td style='padding:6px 10px;text-align:center;font-weight:700;color:{dcol};'>{days}</td>"
+            f"<td style='padding:6px 10px;font-family:monospace;'>{_html.escape(str(row['loan_id']))}</td>"
+            f"<td style='padding:6px 10px;font-family:monospace;'>{_html.escape(str(row['vin']))}</td>"
+            f"<td style='padding:6px 10px;'>{_html.escape(str(row['customer']))}</td>"
+            f"<td style='padding:6px 10px;'>{_html.escape(str(row['orig']))}</td>"
+            f"<td style='padding:6px 10px;text-align:right;'>{_fmt_amt(row['amount'])}</td>"
+            f"</tr>"
+        )
+
+    st.markdown(f"""
+    <table style="width:100%;border-collapse:collapse;font-size:13px;margin-top:4px;">
+      <thead>
+        <tr style="background:{TEAL};">
+          <th style="padding:7px 10px;text-align:center;color:white;font-weight:600;">Days</th>
+          <th style="padding:7px 10px;text-align:left;color:white;font-weight:600;">Loan ID</th>
+          <th style="padding:7px 10px;text-align:left;color:white;font-weight:600;">VIN</th>
+          <th style="padding:7px 10px;text-align:left;color:white;font-weight:600;">Customer</th>
+          <th style="padding:7px 10px;text-align:left;color:white;font-weight:600;">Orig. Date</th>
+          <th style="padding:7px 10px;text-align:right;color:white;font-weight:600;">Loan Amount</th>
+        </tr>
+      </thead>
+      <tbody>{rows_html}</tbody>
+    </table>
+    """, unsafe_allow_html=True)
 
 
 def get_opportunities(credit_df, dealer_id, start_dt, end_dt):
@@ -1009,6 +1223,7 @@ with st.spinner("Loading data…"):
         funnel, name_map, dsm_map, health_df = load_all_data()
         credit_apps   = load_credit_apps()
         pastdue_loans = load_pastdue_loans()
+        unperfected_loans = load_unperfected_loans()
     except Exception as e:
         st.error(f"Could not load data: {e}")
         st.stop()
@@ -1495,6 +1710,8 @@ if dh is None:
         st.dataframe(_pd_df_none[["loan_id","origination_date","vin","days_past_due",
                                    "payments_made","payments_due","first_payment_due_date"]],
                      use_container_width=True, hide_index=True)
+    # ── Unperfected Titles (below delinquent / past due accounts) ──────────────
+    render_unperfected_section(unperfected_loans, sel_dealer)
     st.markdown("</div>", unsafe_allow_html=True)
 else:
     # Determine box tier from worst ratio in a section
@@ -1742,6 +1959,9 @@ else:
           No payments made
         </div>
         """, unsafe_allow_html=True)
+
+    # ── Unperfected Titles (below delinquent / past due accounts) ──────────────
+    render_unperfected_section(unperfected_loans, sel_dealer)
 
     st.markdown("</div>", unsafe_allow_html=True)
 
