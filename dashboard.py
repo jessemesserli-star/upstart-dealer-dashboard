@@ -1188,6 +1188,20 @@ st.markdown(f"""
   @media (min-width: 768px) {{
     header[data-testid="stHeader"] {{ display: none !important; }}
   }}
+  /* Keep the sidebar collapse/expand toggle visible even when header is hidden */
+  @media (min-width: 768px) {{
+    button[data-testid="stSidebarCollapseButton"],
+    button[data-testid="stSidebarExpandButton"] {{
+      display: flex !important;
+      position: fixed;
+      top: 0.5rem;
+      left: 0.5rem;
+      z-index: 9999;
+      background: {DTEAL} !important;
+      color: white !important;
+      border-radius: 4px;
+    }}
+  }}
   /* On mobile keep the header visible so the sidebar hamburger button shows */
   @media (max-width: 767px) {{
     header[data-testid="stHeader"] {{ background: {DTEAL} !important; }}
