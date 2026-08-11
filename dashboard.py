@@ -23,6 +23,7 @@ SHEET_PASTDUE  = "1ZuN4H94EfggMz3lqlBaTo0t4BEQwAMQVxl3SH40JXSE"
 # Unperfected-titles sheet — 3 tabs by aging bucket; "Rooftop Slug" col maps to dealer_id.
 # NOTE: must be shared with the service account for this to load in the deployed dashboard.
 SHEET_UNPERFECTED = "16M8FCQu-BwOwZMS8mYeJMBGJKwP8qYEYRa8NcibQQoQ"
+SHEET_SF          = "1Fg-N2tkzuDUvYfnkRza6exFWR2N32gBwZOZTKv770lg"
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 TEAL  = "#00B3A4"
@@ -30,6 +31,7 @@ DTEAL = "#0D7A74"
 GREEN = "#388E3C"
 RED   = "#D32F2F"
 AMBER = "#F57C00"
+_MH   = "420px"   # shared min-height for metric tile rows
 
 # ── DRM contacts — update phone numbers here ───────────────────────────────────
 DRM_CONTACTS = {
@@ -1174,6 +1176,236 @@ def generate_dealer_pdf(dealer_name, dsm_name, drm_phone, drm_email, period_str,
     return buf.getvalue()
 
 
+# ── Metric box helpers ────────────────────────────────────────────────────────
+TIER_M = {
+    "good":    {"bg":"#e8f8f7", "border":TEAL,  "hdr":DTEAL, "label":"✓ Above Network Average"},
+    "warn":    {"bg":"#fff8e1", "border":AMBER,  "hdr":AMBER, "label":"⚠ Near Network Average"},
+    "bad":     {"bg":"#fff5f5", "border":RED,    "hdr":RED,   "label":"● Below Network Average"},
+    "neutral": {"bg":"#f0faf9", "border":TEAL,   "hdr":DTEAL, "label":""},
+}
+
+def _mbox_tier(val, nav_val, higher_better=True):
+    if val is None or nav_val is None or nav_val == 0: return "neutral"
+    ratio = val / nav_val
+    if higher_better:
+        return "good" if ratio >= 0.9 else ("warn" if ratio >= 0.75 else "bad")
+    else:
+        return "good" if ratio <= 1.1 else ("warn" if ratio <= 1.25 else "bad")
+
+def _mbox(section, tier, rows, min_height=None, bench_label="Network Avg"):
+    """rows: list of (label, your_val, net_val)"""
+    s  = TIER_M[tier]
+    mh = f"min-height:{min_height};" if min_height else ""
+    status = (f"<div style='font-size:10.5px;font-weight:600;color:{s['hdr']};margin-top:2px;"
+              f"margin-bottom:8px;'>{s['label']}</div>") if s["label"] else "<div style='margin-bottom:8px;'></div>"
+    sub = (f"<div style='display:flex;padding:2px 0 4px;border-bottom:1px solid rgba(0,0,0,.1);'>"
+           f"<span style='flex:1;font-size:9.5px;color:#888;'></span>"
+           f"<span style='width:82px;text-align:center;font-size:9.5px;color:#888;'>Your Results</span>"
+           f"<span style='width:82px;text-align:center;font-size:9.5px;color:#888;'>{bench_label}</span>"
+           f"</div>")
+    rows_html = ""
+    for label, yv, nv in rows:
+        rows_html += (
+            f"<div style='display:flex;align-items:center;padding:6px 0;"
+            f"border-bottom:1px solid rgba(0,0,0,.06);'>"
+            f"<span style='flex:1;font-size:12px;color:#444;'>{label}</span>"
+            f"<span style='width:82px;text-align:center;font-size:13px;"
+            f"font-weight:700;color:{s['hdr']};'>{yv}</span>"
+            f"<span style='width:82px;text-align:center;font-size:12px;color:#777;'>{nv}</span>"
+            f"</div>"
+        )
+    return (f"<div style='background:{s['bg']};border:2px solid {s['border']};"
+            f"border-radius:10px;padding:14px 16px;{mh}'>"
+            f"<div style='color:{s['hdr']};font-size:11px;font-weight:700;"
+            f"text-transform:uppercase;letter-spacing:.6px;'>{section}</div>"
+            f"{status}{sub}{rows_html}</div>")
+
+
+# ── Group data ────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_sf_data():
+    """Load Salesforce account sheet to build the dealer → group map."""
+    try:
+        gc = _gs_client()
+        ws = gc.open_by_key(SHEET_SF).worksheet("Live Accounts")
+        rows = ws.get_all_values()
+        if len(rows) < 2:
+            return pd.DataFrame()
+        return pd.DataFrame(rows[1:], columns=rows[0])
+    except Exception:
+        return pd.DataFrame()
+
+
+def build_group_map(sf_df):
+    """Return {group_name: {dealer_ids, dealer_names, dsm_counts, states}}."""
+    groups = {}
+    for _, row in sf_df.iterrows():
+        parent = str(row.get("Parent Account", "")).strip()
+        did    = str(row.get("Chairman Account ID", "")).strip()
+        name   = str(row.get("Account Name", "")).strip()
+        dsm    = str(row.get("Account Owner", "")).strip()
+        state  = str(row.get("Billing State/Province", "")).strip()
+        if not parent or not did:
+            continue
+        if parent not in groups:
+            groups[parent] = {"dealer_ids": [], "dealer_names": {}, "dsm_counts": {}, "states": set()}
+        groups[parent]["dealer_ids"].append(did)
+        groups[parent]["dealer_names"][did] = name
+        groups[parent]["dsm_counts"][dsm] = groups[parent]["dsm_counts"].get(dsm, 0) + 1
+        if state:
+            groups[parent]["states"].add(state)
+    return groups
+
+
+def group_period_metrics(funnel, dealer_ids, sel_weeks):
+    """Aggregate funnel stats for a set of dealer IDs over the selected weeks."""
+    df = funnel[funnel["dealer_id"].isin(dealer_ids) & funnel["week"].isin(sel_weeks)]
+    if df.empty:
+        return None
+    ffs = int(df["FFS"].sum())
+    gr  = int(df["GR"].sum())
+    fl  = int(df["FL"].sum())
+    total_reserve = float(df["total_reserve_at_orig"].sum()) if "total_reserve_at_orig" in df.columns else None
+    total_be      = float(df["total_be_at_orig"].sum())      if "total_be_at_orig"      in df.columns else None
+    return {
+        "ffs": ffs, "gr": gr, "fl": fl,
+        "declined":      max(0, ffs - gr),
+        "approval_rate": gr / ffs if ffs > 0 else None,
+        "l2b":           fl / ffs if ffs > 0 else None,
+        "a2b":           fl / gr  if gr  > 0 else None,
+        "logins":        int(df["Logins"].sum()),
+        "avg_users":     df.groupby("week")["unique_users"].sum().mean() if "unique_users" in df.columns else None,
+        "avg_fico":      _wavg(df, "avg_fico_score_at_pricing", "FFS"),
+        "avg_fico_orig": _wavg(df, "avg_fico_score_at_orig",    "FL"),
+        "avg_principal": _wavg(df, "avg_origination_principal", "FL"),
+        "avg_ltv":       _wavg(df, "avg_ltv_at_approval",       "FL"),
+        "avg_apr":       _wavg(df, "avg_apr_at_orig",           "FL"),
+        "avg_buy_rate":  _wavg(df, "avg_buy_rate_at_orig",      "FL"),
+        "avg_reserve":   total_reserve / fl if (total_reserve is not None and fl > 0) else None,
+        "total_reserve": total_reserve,
+        "avg_be":        total_be / fl if (total_be is not None and fl > 0) else None,
+        "avg_days_to_fund": _wavg(df, "avg_days_to_fund", "FL"),
+    }
+
+
+def group_weekly_trend(funnel, dealer_ids, sel_weeks):
+    """Weekly rows for the group trend chart/table."""
+    df = funnel[funnel["dealer_id"].isin(dealer_ids) & funnel["week"].isin(sel_weeks)].copy()
+    rows = []
+    for wk, grp in sorted(df.groupby("week"), key=lambda x: x[0]):
+        ffs    = int(grp["FFS"].sum())
+        gr     = int(grp["GR"].sum())
+        fl     = int(grp["FL"].sum())
+        logins = int(grp["Logins"].sum())
+        rows.append({
+            "label":     pd.Timestamp(wk).strftime("%-m/%-d"),
+            "apps":      ffs,
+            "approved":  gr,
+            "appr_rate": f"{gr/ffs:.0%}" if ffs > 0 else "0%",
+            "funded":    fl,
+            "l2b":       f"{fl/ffs:.0%}" if ffs > 0 else "0%",
+            "logins":    logins,
+        })
+    return rows
+
+
+def group_dealer_breakdown(funnel, dealer_ids, dealer_names, sel_weeks):
+    """Per-dealer stats within the group, sorted by FL desc."""
+    result = []
+    for did in dealer_ids:
+        name = dealer_names.get(did, did.replace("-", " ").title())
+        m = period_metrics(funnel, did, sel_weeks)
+        if m is None or not m.get("ffs"):
+            result.append((name, None))
+            continue
+        result.append((name, m))
+    active   = sorted([(n, s) for n, s in result if s], key=lambda x: x[1]["fl"], reverse=True)
+    inactive = [(n, s) for n, s in result if not s]
+    return active + inactive
+
+
+def compute_all_groups(funnel, group_map, sel_weeks):
+    """Stats dict for every group that had activity in the period."""
+    result = {}
+    for gname, ginfo in group_map.items():
+        s = group_period_metrics(funnel, ginfo["dealer_ids"], sel_weeks)
+        if s and s["ffs"] > 0:
+            result[gname] = s
+    return result
+
+
+def compute_group_benchmarks_dash(all_group_stats):
+    """Median across active groups for each metric."""
+    rows = list(all_group_stats.values())
+    if not rows:
+        return {}
+    df = pd.DataFrame(rows)
+    result = {}
+    for col in df.columns:
+        vals = df[col].dropna()
+        result[col] = float(vals.median()) if len(vals) > 0 else 0
+    return result
+
+
+def compute_group_rankings_dash(all_group_stats):
+    """FL / reserve / avg_be rankings across groups."""
+    rows = [
+        {"group": g, "fl": s["fl"], "reserve": s.get("total_reserve") or 0, "avg_be": s.get("avg_be") or 0}
+        for g, s in all_group_stats.items()
+    ]
+    if not rows:
+        return {}
+    df = pd.DataFrame(rows)
+    total = len(df)
+    df["fl_rank"]      = df["fl"].rank(ascending=False,      method="min").astype(int)
+    df["reserve_rank"] = df["reserve"].rank(ascending=False, method="min").astype(int)
+    df["be_rank"]      = df["avg_be"].rank(ascending=False,  method="min").astype(int)
+    result = {}
+    for _, row in df.iterrows():
+        result[row["group"]] = {
+            "fl_rank":      int(row["fl_rank"]),
+            "reserve_rank": int(row["reserve_rank"]),
+            "be_rank":      int(row["be_rank"]),
+            "total":        total,
+        }
+    return result
+
+
+def group_performance_insight(stats, benchmarks):
+    """Growth insight text for the group view."""
+    ffs   = stats["ffs"]
+    l2b   = stats["l2b"] or 0
+    fico  = stats["avg_fico"] or 0
+    b_l2b = benchmarks.get("l2b") or 0.05
+    b_ffs = benchmarks.get("ffs") or 20
+
+    if fico > 0 and fico < 615 and l2b < b_l2b * 0.7:
+        return ("Deal Mix Review",
+                "Application mix skews toward subprime",
+                f"Avg FICO at submission is {fico:.0f}, below Upstart's buy box (620+). "
+                f"Look-to-book of {l2b:.1%} reflects low approvals on this mix. "
+                f"Prioritize customers with FICO 620–740 on vehicles 5–10 years old.")
+    if ffs > 0 and ffs < b_ffs * 0.4:
+        return ("Low Volume",
+                "Below-average credit application volume",
+                f"This group submitted {int(ffs)} application{'s' if ffs != 1 else ''} this period "
+                f"(group median: {int(b_ffs)}). Growing submission volume is the fastest path to "
+                f"increasing funded loans across the group.")
+    if l2b >= b_l2b * 0.9:
+        return ("Strong Performer",
+                "Above-average deal quality across the group",
+                f"Look-to-book of {l2b:.1%} is at or above the group network median ({b_l2b:.1%}). "
+                f"Well positioned to grow funded loan volume group-wide.")
+    if l2b < b_l2b * 0.7:
+        return ("Conversion Opportunity",
+                "Look-to-book below group network average",
+                f"Look-to-book of {l2b:.1%} trails the group median ({b_l2b:.1%}). "
+                f"Review deal mix across locations — focus on FICO 620–740, vehicles 5–10 years old.")
+    return ("On Track",
+            "Performing in line with group network averages",
+            f"Submission volume and conversion are tracking with the Upstart group network.")
+
+
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Upstart | Dealer Performance",
@@ -1231,6 +1463,8 @@ with st.spinner("Loading data…"):
         credit_apps   = load_credit_apps()
         pastdue_loans = load_pastdue_loans()
         unperfected_loans = load_unperfected_loans()
+        sf_df         = load_sf_data()
+        group_map     = build_group_map(sf_df) if not sf_df.empty else {}
     except Exception as e:
         st.error(f"Could not load data: {e}")
         st.stop()
@@ -1243,11 +1477,22 @@ with st.sidebar:
     st.markdown("<div style='color:white;font-size:17px;font-weight:700;margin-bottom:14px;'>"
                 "UPSTART | AUTO RETAIL</div>", unsafe_allow_html=True)
 
-    dealer_ids   = sorted(funnel["dealer_id"].dropna().unique(), key=lambda d: name_map.get(d, d))
-    display_opts = [f"{name_map.get(d, d)}  ({d})" for d in dealer_ids]
+    view = st.radio("View", ["Dealer", "Group"], horizontal=True,
+                    label_visibility="collapsed")
 
-    sel_disp   = st.selectbox("Dealer", display_opts)
-    sel_dealer = dealer_ids[display_opts.index(sel_disp)]
+    st.markdown("---")
+
+    if view == "Dealer":
+        dealer_ids   = sorted(funnel["dealer_id"].dropna().unique(), key=lambda d: name_map.get(d, d))
+        display_opts = [f"{name_map.get(d, d)}  ({d})" for d in dealer_ids]
+        sel_disp   = st.selectbox("Dealer", display_opts)
+        sel_dealer = dealer_ids[display_opts.index(sel_disp)]
+    else:
+        group_names = sorted(group_map.keys()) if group_map else []
+        if not group_names:
+            st.warning("No group data available.")
+            st.stop()
+        sel_group = st.selectbox("Group", group_names)
 
     st.markdown("---")
     st.markdown("<span style='color:white;font-weight:600;font-size:13px;'>Date Range</span>",
@@ -1283,31 +1528,300 @@ with st.sidebar:
     st.caption("Auto-refreshes every 30 min")
 
 
-# ── Compute ────────────────────────────────────────────────────────────────────
-p           = period_metrics(funnel, sel_dealer, sel_weeks)
-dealer_name = name_map.get(sel_dealer, sel_dealer)
-dsm_name    = dsm_map.get(sel_dealer, "—")
-drm_info    = DRM_CONTACTS.get(dsm_name, {})
-drm_phone   = drm_info.get("phone", "")
-drm_email   = drm_info.get("email", "")
-
-dealer_stats, nav = compute_network_stats(funnel, sel_weeks)
-
-ric_rank    = percentile_rank(dealer_stats, "ric",          sel_dealer, True)
-res_rank    = percentile_rank(dealer_stats, "total_reserve",sel_dealer, True)
-be_rank     = percentile_rank(dealer_stats, "avg_be",       sel_dealer, True)
-
-opp_title, opp_body = generate_opportunity(p, nav, dealer_name)
-
-wkly = weekly_breakdown(funnel, sel_dealer, sel_weeks)
-dh   = get_health(health_df, sel_dealer)
-bm   = health_benchmark(health_df)
-
+# ── Shared period string ───────────────────────────────────────────────────────
 period_str = (f"{pd.Timestamp(sel_weeks[0]).strftime('%-m/%-d')} – "
               f"{(pd.Timestamp(sel_weeks[-1]) + pd.Timedelta(days=6)).strftime('%-m/%-d/%Y')}")
 
+# ── DEALER VIEW ────────────────────────────────────────────────────────────────
+if view == "Dealer":
+    p           = period_metrics(funnel, sel_dealer, sel_weeks)
+    dealer_name = name_map.get(sel_dealer, sel_dealer)
+    dsm_name    = dsm_map.get(sel_dealer, "—")
+    drm_info    = DRM_CONTACTS.get(dsm_name, {})
+    drm_phone   = drm_info.get("phone", "")
+    drm_email   = drm_info.get("email", "")
 
-# ── HEADER ─────────────────────────────────────────────────────────────────────
+    dealer_stats, nav = compute_network_stats(funnel, sel_weeks)
+
+    ric_rank    = percentile_rank(dealer_stats, "ric",          sel_dealer, True)
+    res_rank    = percentile_rank(dealer_stats, "total_reserve",sel_dealer, True)
+    be_rank     = percentile_rank(dealer_stats, "avg_be",       sel_dealer, True)
+
+    opp_title, opp_body = generate_opportunity(p, nav, dealer_name)
+
+    wkly = weekly_breakdown(funnel, sel_dealer, sel_weeks)
+    dh   = get_health(health_df, sel_dealer)
+    bm   = health_benchmark(health_df)
+
+
+# ── GROUP VIEW ────────────────────────────────────────────────────────────────
+if view == "Group":
+    ginfo      = group_map.get(sel_group, {})
+    g_dealer_ids   = ginfo.get("dealer_ids", [])
+    g_dealer_names = ginfo.get("dealer_names", {})
+    g_dsm      = max(ginfo.get("dsm_counts", {"—": 1}), key=lambda k: ginfo["dsm_counts"][k])
+    gp         = group_period_metrics(funnel, g_dealer_ids, sel_weeks)
+    g_wkly     = group_weekly_trend(funnel, g_dealer_ids, sel_weeks)
+    g_bkdn     = group_dealer_breakdown(funnel, g_dealer_ids, g_dealer_names, sel_weeks)
+    all_gstats = compute_all_groups(funnel, group_map, sel_weeks)
+    g_bench    = compute_group_benchmarks_dash(all_gstats)
+    g_ranks    = compute_group_rankings_dash(all_gstats)
+    g_rank     = g_ranks.get(sel_group, {})
+    total_grps = g_rank.get("total", len(all_gstats))
+
+    # ── Group header ─────────────────────────────────────────────────────────
+    st.markdown(f"""
+<div style="background:linear-gradient(135deg,{DTEAL} 0%,{TEAL} 60%,#00c9ba 100%);
+            padding:14px 20px 12px;border-radius:8px;
+            display:flex;justify-content:space-between;align-items:center;
+            margin-bottom:4px;box-shadow:0 2px 8px rgba(0,0,0,.12);">
+  <div>
+    <span style="color:white;font-size:20px;font-weight:900;letter-spacing:.5px;">UPSTART</span>
+    <span style="color:rgba(255,255,255,.75);font-size:14px;"> | AUTO RETAIL</span>
+  </div>
+  <div style="text-align:right;">
+    <div style="color:rgba(255,255,255,.75);font-size:11px;">Group Performance Report</div>
+    <div style="color:white;font-size:14px;font-weight:700;">{period_str}</div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+    st.markdown(f"""
+<div style="margin:6px 0 2px;">
+  <span style="font-size:22px;font-weight:800;color:#111;">{_html.escape(sel_group)}</span>
+</div>
+<div style="font-size:13px;color:#555;margin-bottom:8px;">
+  DSM: <b>{_html.escape(g_dsm)}</b>
+  &nbsp;·&nbsp; {len(g_dealer_ids)} dealer location{'s' if len(g_dealer_ids) != 1 else ''}
+</div>
+""", unsafe_allow_html=True)
+
+    if gp is None:
+        st.info("No activity data found for this group in the selected period.")
+        st.stop()
+
+    # ── Rankings ─────────────────────────────────────────────────────────────
+    def _grp_rank_badge(label, rank_key):
+        rank = g_rank.get(rank_key)
+        if rank is None:
+            return rank_badge(label, "N/A", "neutral")
+        pct_val = (1 - rank / total_grps) * 100 if total_grps > 1 else 100
+        pct_lbl = f"Top {max(1, round(100 - pct_val))}%" if pct_val >= 50 else f"Bottom {max(1, round(pct_val))}%"
+        tier    = "top" if pct_val >= 50 else "bottom"
+        return rank_badge(label, pct_lbl, tier)
+
+    st.markdown(
+        f"<div style='display:flex;gap:0;margin-bottom:14px;'>"
+        + _grp_rank_badge("Funded Loans",        "fl_rank")
+        + _grp_rank_badge("Total Reserve Earned", "reserve_rank")
+        + _grp_rank_badge("Avg Back End",          "be_rank")
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Performance insight ───────────────────────────────────────────────────
+    _ins_title, _ins_sub, _ins_body = group_performance_insight(gp, g_bench)
+    st.markdown(f"""
+<div style="display:flex;align-items:stretch;margin-bottom:18px;gap:0;
+            border:1px solid #e0e0e0;border-radius:6px;overflow:hidden;">
+  <div style="background:{TEAL};color:white;padding:12px 14px;font-size:11.5px;
+              font-weight:700;text-align:center;min-width:90px;max-width:90px;
+              display:flex;align-items:center;justify-content:center;line-height:1.4;">
+    Group<br>Insight
+  </div>
+  <div style="padding:12px 16px;background:white;flex:1;">
+    <div style="font-weight:700;font-size:13.5px;color:#111;margin-bottom:4px;">
+      {_html.escape(_ins_sub)}
+    </div>
+    <div style="font-size:13px;color:#444;line-height:1.55;">
+      {_html.escape(_ins_body)}
+    </div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+    # ── Metric grid ───────────────────────────────────────────────────────────
+    nav_dec_g = max(0, (g_bench.get("ffs") or 0) - (g_bench.get("gr") or 0))
+    ap_tier_g = _mbox_tier(gp.get("approval_rate"), g_bench.get("approval_rate"), higher_better=True)
+    fp_tier_g = _mbox_tier(gp.get("l2b"),           g_bench.get("l2b"),           higher_better=True)
+    dq_tier_g = _mbox_tier(gp.get("avg_fico_orig"), g_bench.get("avg_fico_orig"), higher_better=True)
+
+    _gc1, _gc2, _gc3 = st.columns(3, gap="medium")
+    with _gc1:
+        st.markdown(_mbox("Engagement", ap_tier_g, [
+            ("Total Logins",            _n(gp["logins"]),  "—"),
+            ("Avg Weekly Unique Users",
+             _n((gp.get("avg_users") or 0), 1) if gp.get("avg_users") else "—", "—"),
+            ("Apps Submitted", _n(gp["ffs"]), _n(g_bench.get("ffs"))),
+            ("Approved",       _n(gp["gr"]),  _n(g_bench.get("gr"))),
+            ("Declined",       _n(gp["declined"]), _n(nav_dec_g or None)),
+            ("Approval Rate",  _p(gp["approval_rate"]), _p(g_bench.get("approval_rate"))),
+            ("Avg FICO at App",_n(gp["avg_fico"]),       _n(g_bench.get("avg_fico"))),
+        ], min_height=_MH, bench_label="Group Median"), unsafe_allow_html=True)
+    with _gc2:
+        st.markdown(_mbox("Funding Performance", fp_tier_g, [
+            ("Funded Loans",     _n(gp["fl"]),                  _n(g_bench.get("fl"))),
+            ("Look to Book",     _p(gp["l2b"]),                 _p(g_bench.get("l2b"))),
+            ("Approve to Book",  _p(gp["a2b"]),                 _p(g_bench.get("a2b"))),
+            ("Avg Days to Fund", _n(gp["avg_days_to_fund"], 1), _n(g_bench.get("avg_days_to_fund"), 1)),
+        ], min_height=_MH, bench_label="Group Median"), unsafe_allow_html=True)
+    with _gc3:
+        st.markdown(_mbox("Deal Quality & Profitability", dq_tier_g, [
+            ("Avg FICO (Funded)",       _n(gp["avg_fico_orig"]), _n(g_bench.get("avg_fico_orig"))),
+            ("Avg Amount Financed",     _d(gp["avg_principal"]), _d(g_bench.get("avg_principal"))),
+            ("Avg LTV",                 _p(gp["avg_ltv"]),       _p(g_bench.get("avg_ltv"))),
+            ("Avg Contract Rate (APR)", _p(gp["avg_apr"]),       _p(g_bench.get("avg_apr"))),
+            ("Avg Buy Rate",            _p(gp["avg_buy_rate"]),  _p(g_bench.get("avg_buy_rate"))),
+            ("Avg Reserve",             _d(gp["avg_reserve"]),   _d(g_bench.get("avg_reserve"))),
+            ("Total Reserve Earned",    _d(gp["total_reserve"]), _d(g_bench.get("total_reserve"))),
+            ("Avg Back End",            _d(gp["avg_be"]),        _d(g_bench.get("avg_be"))),
+        ], min_height=_MH, bench_label="Group Median"), unsafe_allow_html=True)
+
+    # ── Weekly trend ─────────────────────────────────────────────────────────
+    st.markdown("<div style='margin-top:24px;'></div>", unsafe_allow_html=True)
+    st.markdown(f"<div style='color:{DTEAL};font-size:13px;font-weight:700;margin:4px 0 8px;'>"
+                f"Week-by-Week — {period_str}</div>", unsafe_allow_html=True)
+
+    if not g_wkly:
+        st.info("No weekly data for this group in the selected period.")
+    else:
+        wk_labels_g = [r["label"] for r in g_wkly]
+        fig_g = go.Figure()
+        fig_g.add_trace(go.Bar(
+            x=wk_labels_g, y=[r["apps"] for r in g_wkly],
+            name="FFS Submitted", marker_color="#80cbc4", opacity=0.85,
+        ))
+        fig_g.add_trace(go.Bar(
+            x=wk_labels_g, y=[r["funded"] for r in g_wkly],
+            name="Funded Loans", marker_color=TEAL,
+        ))
+        fig_g.add_trace(go.Scatter(
+            x=wk_labels_g, y=[r["logins"] for r in g_wkly],
+            name="Log-ins", mode="lines+markers",
+            line=dict(color=DTEAL, width=2), marker=dict(size=7),
+            yaxis="y2",
+        ))
+        fig_g.update_layout(
+            barmode="group", height=280,
+            margin=dict(t=20, b=20, l=0, r=0),
+            plot_bgcolor="white", paper_bgcolor="white",
+            yaxis=dict(title="FFS / Funded", gridcolor="#eee", gridwidth=1),
+            yaxis2=dict(title="Log-ins", overlaying="y", side="right", showgrid=False),
+            legend=dict(orientation="h", y=1.08, x=0, font=dict(size=11)),
+            xaxis=dict(showgrid=False),
+        )
+        st.plotly_chart(fig_g, use_container_width=True, config={"displayModeBar": False})
+
+        g_total_apps = sum(r["apps"] for r in g_wkly)
+        g_total_appr = sum(r["approved"] for r in g_wkly)
+        g_total_fund = sum(r["funded"] for r in g_wkly)
+        g_wkly_body  = ""
+        for i, r in enumerate(g_wkly):
+            bg = "#F5F7FA" if i % 2 == 0 else "white"
+            g_wkly_body += (
+                f"<tr style='background:{bg};'>"
+                f"<td style='padding:7px 12px;text-align:center;'>{r['label']}</td>"
+                f"<td style='padding:7px 12px;text-align:center;'>{r['apps']}</td>"
+                f"<td style='padding:7px 12px;text-align:center;'>{r['approved']}</td>"
+                f"<td style='padding:7px 12px;text-align:center;'>{r['appr_rate']}</td>"
+                f"<td style='padding:7px 12px;text-align:center;'>{r['funded']}</td>"
+                f"<td style='padding:7px 12px;text-align:center;'>{r['l2b']}</td>"
+                f"</tr>"
+            )
+        g_appr_rate = f"{g_total_appr/g_total_apps:.0%}" if g_total_apps > 0 else "0%"
+        g_l2b       = f"{g_total_fund/g_total_apps:.0%}"  if g_total_apps > 0 else "0%"
+        g_wkly_body += (
+            f"<tr style='background:{TEAL};color:white;font-weight:700;'>"
+            f"<td style='padding:7px 12px;text-align:center;'>Total</td>"
+            f"<td style='padding:7px 12px;text-align:center;'>{g_total_apps}</td>"
+            f"<td style='padding:7px 12px;text-align:center;'>{g_total_appr}</td>"
+            f"<td style='padding:7px 12px;text-align:center;'>{g_appr_rate}</td>"
+            f"<td style='padding:7px 12px;text-align:center;'>{g_total_fund}</td>"
+            f"<td style='padding:7px 12px;text-align:center;'>{g_l2b}</td>"
+            f"</tr>"
+        )
+        st.markdown(f"""
+<table style="width:100%;border-collapse:collapse;font-size:13px;margin-top:4px;">
+  <thead>
+    <tr style="background:{TEAL};">
+      <th style="padding:7px 12px;text-align:center;color:white;font-weight:600;">Week</th>
+      <th style="padding:7px 12px;text-align:center;color:white;font-weight:600;">Apps</th>
+      <th style="padding:7px 12px;text-align:center;color:white;font-weight:600;">Approved</th>
+      <th style="padding:7px 12px;text-align:center;color:white;font-weight:600;">Appr. Rate</th>
+      <th style="padding:7px 12px;text-align:center;color:white;font-weight:600;">Funded</th>
+      <th style="padding:7px 12px;text-align:center;color:white;font-weight:600;">L2B</th>
+    </tr>
+  </thead>
+  <tbody>{g_wkly_body}</tbody>
+</table>
+""", unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # ── Dealer breakdown ──────────────────────────────────────────────────────
+    st.markdown(f"<div style='color:{DTEAL};font-size:13px;font-weight:700;margin-bottom:8px;'>"
+                f"Dealer Breakdown</div>", unsafe_allow_html=True)
+
+    if not g_bkdn:
+        st.info("No dealer data available for this group.")
+    else:
+        bkdn_rows = ""
+        for i, (dname, ds) in enumerate(g_bkdn):
+            bg = "#F5F7FA" if i % 2 == 0 else "white"
+            if ds is None:
+                bkdn_rows += (
+                    f"<tr style='background:{bg};color:#aaa;font-style:italic;'>"
+                    f"<td style='padding:7px 12px;'>{_html.escape(dname)}</td>"
+                    + "<td style='padding:7px 12px;text-align:center;'>—</td>" * 9
+                    + "</tr>"
+                )
+            else:
+                bkdn_rows += (
+                    f"<tr style='background:{bg};'>"
+                    f"<td style='padding:7px 12px;font-weight:600;'>{_html.escape(dname)}</td>"
+                    f"<td style='padding:7px 12px;text-align:center;'>{_n(ds['logins'])}</td>"
+                    f"<td style='padding:7px 12px;text-align:center;'>{_n(ds['ffs'])}</td>"
+                    f"<td style='padding:7px 12px;text-align:center;'>{_n(ds['gr'])}</td>"
+                    f"<td style='padding:7px 12px;text-align:center;'>{_p(ds['approval_rate'])}</td>"
+                    f"<td style='padding:7px 12px;text-align:center;'>{_n(ds['ric'])}</td>"
+                    f"<td style='padding:7px 12px;text-align:center;'>{_p(ds['l2b'])}</td>"
+                    f"<td style='padding:7px 12px;text-align:center;'>{_p(ds['a2b'])}</td>"
+                    f"<td style='padding:7px 12px;text-align:right;'>{_d(ds['total_reserve'])}</td>"
+                    f"<td style='padding:7px 12px;text-align:right;'>{_d(ds['avg_be'])}</td>"
+                    f"</tr>"
+                )
+        st.markdown(f"""
+<table style="width:100%;border-collapse:collapse;font-size:12.5px;margin-top:4px;">
+  <thead>
+    <tr style="background:{TEAL};">
+      <th style="padding:7px 12px;text-align:left;color:white;font-weight:600;">Dealer</th>
+      <th style="padding:7px 12px;text-align:center;color:white;font-weight:600;">Logins</th>
+      <th style="padding:7px 12px;text-align:center;color:white;font-weight:600;">Apps</th>
+      <th style="padding:7px 12px;text-align:center;color:white;font-weight:600;">Approved</th>
+      <th style="padding:7px 12px;text-align:center;color:white;font-weight:600;">Appr. Rate</th>
+      <th style="padding:7px 12px;text-align:center;color:white;font-weight:600;">Funded</th>
+      <th style="padding:7px 12px;text-align:center;color:white;font-weight:600;">L2B</th>
+      <th style="padding:7px 12px;text-align:center;color:white;font-weight:600;">A2B</th>
+      <th style="padding:7px 12px;text-align:right;color:white;font-weight:600;">Total Reserve</th>
+      <th style="padding:7px 12px;text-align:right;color:white;font-weight:600;">Avg Back End</th>
+    </tr>
+  </thead>
+  <tbody>{bkdn_rows}</tbody>
+</table>
+""", unsafe_allow_html=True)
+
+    # ── Group footer ──────────────────────────────────────────────────────────
+    from datetime import datetime as _dt_g
+    st.markdown(
+        f"<div style='text-align:center;font-size:11px;color:#aaa;margin-top:12px;'>"
+        f"Generated {_dt_g.now().strftime('%B %d, %Y')} · Confidential — For internal use only · Upstart Auto Retail"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    st.stop()
+
+
+# ── DEALER VIEW: HEADER ────────────────────────────────────────────────────────
 st.markdown(f"""
 <div style="background:linear-gradient(135deg,{DTEAL} 0%,{TEAL} 60%,#00c9ba 100%);
             padding:14px 20px 12px;border-radius:8px;
@@ -1459,56 +1973,11 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ── 2×2 METRIC GRID ───────────────────────────────────────────────────────────
-TIER_M = {
-    "good":    {"bg":"#e8f8f7", "border":TEAL,  "hdr":DTEAL, "label":"✓ Above Network Average"},
-    "warn":    {"bg":"#fff8e1", "border":AMBER,  "hdr":AMBER, "label":"⚠ Near Network Average"},
-    "bad":     {"bg":"#fff5f5", "border":RED,    "hdr":RED,   "label":"● Below Network Average"},
-    "neutral": {"bg":"#f0faf9", "border":TEAL,   "hdr":DTEAL, "label":""},
-}
-
-def _mbox_tier(val, nav_val, higher_better=True):
-    if val is None or nav_val is None or nav_val == 0: return "neutral"
-    ratio = val / nav_val
-    if higher_better:
-        return "good" if ratio >= 0.9 else ("warn" if ratio >= 0.75 else "bad")
-    else:
-        return "good" if ratio <= 1.1 else ("warn" if ratio <= 1.25 else "bad")
-
-def _mbox(section, tier, rows, min_height=None):
-    """rows: list of (label, your_val, net_val)"""
-    s  = TIER_M[tier]
-    mh = f"min-height:{min_height};" if min_height else ""
-    status = (f"<div style='font-size:10.5px;font-weight:600;color:{s['hdr']};margin-top:2px;"
-              f"margin-bottom:8px;'>{s['label']}</div>") if s["label"] else "<div style='margin-bottom:8px;'></div>"
-    sub = (f"<div style='display:flex;padding:2px 0 4px;border-bottom:1px solid rgba(0,0,0,.1);'>"
-           f"<span style='flex:1;font-size:9.5px;color:#888;'></span>"
-           f"<span style='width:82px;text-align:center;font-size:9.5px;color:#888;'>Your Results</span>"
-           f"<span style='width:82px;text-align:center;font-size:9.5px;color:#888;'>Network Avg</span>"
-           f"</div>")
-    rows_html = ""
-    for label, yv, nv in rows:
-        rows_html += (
-            f"<div style='display:flex;align-items:center;padding:6px 0;"
-            f"border-bottom:1px solid rgba(0,0,0,.06);'>"
-            f"<span style='flex:1;font-size:12px;color:#444;'>{label}</span>"
-            f"<span style='width:82px;text-align:center;font-size:13px;"
-            f"font-weight:700;color:{s['hdr']};'>{yv}</span>"
-            f"<span style='width:82px;text-align:center;font-size:12px;color:#777;'>{nv}</span>"
-            f"</div>"
-        )
-    return (f"<div style='background:{s['bg']};border:2px solid {s['border']};"
-            f"border-radius:10px;padding:14px 16px;{mh}'>"
-            f"<div style='color:{s['hdr']};font-size:11px;font-weight:700;"
-            f"text-transform:uppercase;letter-spacing:.6px;'>{section}</div>"
-            f"{status}{sub}{rows_html}</div>")
-
 # Tier per section — drives box color
 nav_dec  = max(0, (nav.get("ffs") or 0) - (nav.get("gr") or 0))
 ap_tier  = _mbox_tier(p.get("approval_rate"), nav.get("approval_rate"), higher_better=True)
 fp_tier  = _mbox_tier(p.get("l2b"),           nav.get("l2b"),           higher_better=True)
 dq_tier2 = _mbox_tier(p.get("avg_fico_orig"), nav.get("avg_fico_orig"), higher_better=True)
-
-_MH = "420px"   # shared height — all 3 tiles in one row
 
 _mc1, _mc2, _mc3 = st.columns(3, gap="medium")
 with _mc1:
