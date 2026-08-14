@@ -1176,6 +1176,309 @@ def generate_dealer_pdf(dealer_name, dsm_name, drm_phone, drm_email, period_str,
     return buf.getvalue()
 
 
+# ── Group PDF generation ──────────────────────────────────────────────────────
+def generate_group_pdf(group_name, g_dsm, period_str, gp, g_bench, g_rank,
+                       total_grps, ins_sub, ins_body, g_wkly, g_bkdn):
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.units import inch
+    from reportlab.lib import colors as rc
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Spacer, PageBreak
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+    from io import BytesIO
+    from datetime import datetime as _dt
+
+    CT  = rc.HexColor("#00B3A4")
+    CDT = rc.HexColor("#0D7A74")
+    CLG = rc.HexColor("#F5F7FA")
+    CMG = rc.HexColor("#DDDDDD")
+    CDG = rc.HexColor("#555555")
+    CA  = rc.HexColor("#F57C00")
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter,
+                            leftMargin=.5*inch, rightMargin=.5*inch,
+                            topMargin=.4*inch, bottomMargin=.45*inch)
+
+    def ps(name, **kw):
+        d = dict(fontName="Helvetica", fontSize=9, leading=12, textColor=rc.black)
+        d.update(kw); return ParagraphStyle(name, **d)
+
+    def header_tbl():
+        t = Table([[
+            Paragraph("<font color='white'><b>UPSTART | AUTO RETAIL</b></font>",
+                      ps("hL", fontSize=15, fontName="Helvetica-Bold")),
+            Paragraph(f"<font color='white'>Group Performance Report<br/><b>{period_str}</b></font>",
+                      ps("hR", fontSize=9, alignment=TA_RIGHT, leading=14)),
+        ]], colWidths=[4.0*inch, 3.6*inch])
+        t.setStyle(TableStyle([
+            ("BACKGROUND",   (0,0), (-1,-1), CT),
+            ("VALIGN",       (0,0), (-1,-1), "MIDDLE"),
+            ("LEFTPADDING",  (0,0), (-1,-1), 12),
+            ("RIGHTPADDING", (0,0), (-1,-1), 12),
+            ("TOPPADDING",   (0,0), (-1,-1), 10),
+            ("BOTTOMPADDING",(0,0), (-1,-1), 10),
+        ]))
+        return t
+
+    def mt(section, rows, bench_hdr="Group Median"):
+        cw = [1.95*inch, 0.72*inch, 0.72*inch]
+        hdr = [
+            Paragraph(f"<b>{section}</b>",
+                      ps(f"s{section[:4]}", fontSize=8.5, fontName="Helvetica-Bold", textColor=CT)),
+            Paragraph("<b>This Group</b>",
+                      ps("yr", fontSize=7, textColor=rc.HexColor("#999999"), alignment=TA_RIGHT)),
+            Paragraph(f"<b>{bench_hdr}</b>",
+                      ps("na", fontSize=7, textColor=rc.HexColor("#999999"), alignment=TA_RIGHT)),
+        ]
+        data = [hdr]
+        for i, (label, yr, na) in enumerate(rows):
+            data.append([
+                Paragraph(label, ps(f"l{i}", fontSize=8)),
+                Paragraph(f"<b>{yr}</b>",
+                          ps(f"r{i}", fontSize=8.5, fontName="Helvetica-Bold", alignment=TA_RIGHT)),
+                Paragraph(na, ps(f"n{i}", fontSize=8, textColor=CDG, alignment=TA_RIGHT)),
+            ])
+        tbl = Table(data, colWidths=cw)
+        cmds = [
+            ("LINEBELOW",    (0,0), (-1,0), 1.5, CT),
+            ("TOPPADDING",   (0,0), (-1,-1), 3),
+            ("BOTTOMPADDING",(0,0), (-1,-1), 3),
+            ("LEFTPADDING",  (0,0), (-1,-1), 3),
+            ("RIGHTPADDING", (0,0), (-1,-1), 3),
+            ("VALIGN",       (0,0), (-1,-1), "MIDDLE"),
+        ]
+        for i in range(1, len(data)):
+            if i % 2 == 1:
+                cmds.append(("BACKGROUND", (0,i), (-1,i), CLG))
+            cmds.append(("LINEBELOW", (0,i), (-1,i), 0.3, CMG))
+        tbl.setStyle(TableStyle(cmds))
+        return tbl
+
+    story = []
+
+    # ── Page 1 ──────────────────────────────────────────────────────────────────
+    story.append(header_tbl())
+    story.append(Spacer(1, 6))
+
+    story.append(Paragraph(f"<b>{group_name}</b>", ps("gn", fontSize=16, fontName="Helvetica-Bold")))
+    story.append(Paragraph(
+        f"<font color='#555555'>DSM: <b>{g_dsm}</b></font>",
+        ps("dsm")
+    ))
+    story.append(Spacer(1, 8))
+
+    # Rankings
+    story.append(Paragraph("GROUP NETWORK RANKING",
+                           ps("nrhdr", fontSize=7.5, fontName="Helvetica-Bold",
+                              textColor=rc.HexColor("#888888"), spaceAfter=4)))
+
+    def _rank_lbl(rank_key):
+        rank = g_rank.get(rank_key)
+        if rank is None or total_grps < 2:
+            return "N/A"
+        pct = (1 - rank / total_grps) * 100
+        return f"Top {max(1, round(100 - pct))}%" if pct >= 50 else f"Bottom {max(1, round(pct))}%"
+
+    def _rbg(rank_key):
+        rank = g_rank.get(rank_key)
+        if rank is None or total_grps < 2:
+            return CDG
+        pct = (1 - rank / total_grps) * 100
+        return CDT if pct >= 50 else CA
+
+    rk = Table([[
+        Paragraph(f"<font color='white'><b>Funded Loans</b></font><br/>"
+                  f"<font color='white' size='11'><b>{_rank_lbl('fl_rank')}</b></font>",
+                  ps("rk1", alignment=TA_CENTER, leading=16)),
+        Paragraph(f"<font color='white'><b>Total Reserve Earned</b></font><br/>"
+                  f"<font color='white' size='11'><b>{_rank_lbl('reserve_rank')}</b></font>",
+                  ps("rk2", alignment=TA_CENTER, leading=16)),
+        Paragraph(f"<font color='white'><b>Avg Back End</b></font><br/>"
+                  f"<font color='white' size='11'><b>{_rank_lbl('be_rank')}</b></font>",
+                  ps("rk3", alignment=TA_CENTER, leading=16)),
+    ]], colWidths=[2.47*inch]*3)
+    rk.setStyle(TableStyle([
+        ("BACKGROUND",  (0,0), (0,-1), _rbg("fl_rank")),
+        ("BACKGROUND",  (1,0), (1,-1), _rbg("reserve_rank")),
+        ("BACKGROUND",  (2,0), (2,-1), _rbg("be_rank")),
+        ("ALIGN",       (0,0), (-1,-1), "CENTER"),
+        ("VALIGN",      (0,0), (-1,-1), "MIDDLE"),
+        ("TOPPADDING",  (0,0), (-1,-1), 8),
+        ("BOTTOMPADDING",(0,0),(-1,-1), 8),
+        ("LINEAFTER",   (0,0), (1,-1), 0.5, rc.white),
+    ]))
+    story.append(rk)
+    story.append(Spacer(1, 8))
+
+    # Group insight
+    opp = Table([[
+        Paragraph("<font color='white'><b>Group\nInsight</b></font>",
+                  ps("goL", fontSize=9, fontName="Helvetica-Bold", alignment=TA_CENTER, leading=14)),
+        [Paragraph(f"<b>{ins_sub}</b>", ps("goT", fontSize=9, fontName="Helvetica-Bold")),
+         Spacer(1, 3),
+         Paragraph(ins_body, ps("goB", fontSize=8.5, textColor=CDG))],
+    ]], colWidths=[1.05*inch, 6.30*inch])
+    opp.setStyle(TableStyle([
+        ("BACKGROUND",  (0,0), (0,-1), CT),
+        ("BACKGROUND",  (1,0), (1,-1), rc.HexColor("#F0FAF9")),
+        ("VALIGN",      (0,0), (-1,-1), "MIDDLE"),
+        ("TOPPADDING",  (0,0), (-1,-1), 8),
+        ("BOTTOMPADDING",(0,0),(-1,-1), 8),
+        ("LEFTPADDING", (0,0), (0,-1), 6),
+        ("RIGHTPADDING",(0,0), (0,-1), 6),
+        ("LEFTPADDING", (1,0), (1,-1), 10),
+        ("RIGHTPADDING",(1,0), (1,-1), 8),
+        ("BOX",         (0,0), (-1,-1), 0.5, CMG),
+    ]))
+    story.append(opp)
+    story.append(Spacer(1, 10))
+
+    # Two-column metrics
+    nav_dec_g = max(0, (g_bench.get("ffs") or 0) - (g_bench.get("gr") or 0))
+    left_col = [
+        mt("User Engagement", [
+            ("Total Logins", _n(gp["logins"]), "—"),
+            ("Avg Weekly Unique Users",
+             _n((gp.get("avg_users") or 0), 1) if gp.get("avg_users") else "—", "—"),
+        ]),
+        Spacer(1, 8),
+        mt("Application Performance", [
+            ("Apps Submitted", _n(gp["ffs"]),         _n(g_bench.get("ffs"))),
+            ("Approved",       _n(gp["gr"]),           _n(g_bench.get("gr"))),
+            ("Declined",       _n(gp["declined"]),     _n(nav_dec_g)),
+            ("Approval Rate",  _p(gp["approval_rate"]),_p(g_bench.get("approval_rate"))),
+            ("Avg FICO at App",_n(gp["avg_fico"]),     _n(g_bench.get("avg_fico"))),
+        ]),
+    ]
+    right_col = [
+        mt("Funding Performance", [
+            ("Funded Loans",    _n(gp["fl"]),                        _n(g_bench.get("fl"))),
+            ("Look to Book",    _p(gp["l2b"]),                       _p(g_bench.get("l2b"))),
+            ("Approve to Book", _p(gp["a2b"]),                       _p(g_bench.get("a2b"))),
+            ("Avg Days to Fund",_n(gp["avg_days_to_fund"], 1),       _n(g_bench.get("avg_days_to_fund"), 1)),
+        ]),
+        Spacer(1, 8),
+        mt("Deal Quality & Profitability", [
+            ("Avg FICO (Funded)",       _n(gp["avg_fico_orig"]), _n(g_bench.get("avg_fico_orig"))),
+            ("Avg Amount Financed",     _d(gp["avg_principal"]), _d(g_bench.get("avg_principal"))),
+            ("Avg LTV",                 _p(gp["avg_ltv"]),       _p(g_bench.get("avg_ltv"))),
+            ("Avg Contract Rate (APR)", _p(gp["avg_apr"]),       _p(g_bench.get("avg_apr"))),
+            ("Avg Buy Rate",            _p(gp["avg_buy_rate"]),  _p(g_bench.get("avg_buy_rate"))),
+            ("Avg Reserve",             _d(gp["avg_reserve"]),   _d(g_bench.get("avg_reserve"))),
+            ("Total Reserve Earned",    _d(gp["total_reserve"]), _d(g_bench.get("total_reserve"))),
+            ("Avg Back End",            _d(gp["avg_be"]),        _d(g_bench.get("avg_be"))),
+        ]),
+    ]
+    two = Table([[left_col, right_col]], colWidths=[3.7*inch, 3.7*inch])
+    two.setStyle(TableStyle([
+        ("VALIGN",       (0,0), (-1,-1), "TOP"),
+        ("LEFTPADDING",  (0,0), (-1,-1), 0),
+        ("RIGHTPADDING", (0,0), (0,-1), 8),
+        ("TOPPADDING",   (0,0), (-1,-1), 0),
+        ("BOTTOMPADDING",(0,0), (-1,-1), 0),
+        ("LINEAFTER",    (0,0), (0,-1), 0.5, CMG),
+    ]))
+    story.append(two)
+
+    # Weekly table
+    if g_wkly:
+        story.append(Spacer(1, 10))
+        story.append(Paragraph(f"Week-by-Week — {period_str}",
+                               ps("wbw", fontSize=10, fontName="Helvetica-Bold",
+                                  textColor=CDT, spaceAfter=4)))
+        total_apps = sum(r["apps"] for r in g_wkly)
+        total_appr = sum(r["approved"] for r in g_wkly)
+        total_fund = sum(r["funded"] for r in g_wkly)
+        wd = [["Week", "Apps", "Approved", "Appr. Rate", "Funded", "L2B"]]
+        for r in g_wkly:
+            wd.append([r["label"], str(r["apps"]), str(r["approved"]),
+                       r["appr_rate"], str(r["funded"]), r["l2b"]])
+        wd.append(["Total", str(total_apps), str(total_appr),
+                   f"{total_appr/total_apps:.0%}" if total_apps else "0%",
+                   str(total_fund),
+                   f"{total_fund/total_apps:.0%}" if total_apps else "0%"])
+        wt = Table(wd, colWidths=[.8*inch, .9*inch, .9*inch, 1.0*inch, .9*inch, .8*inch])
+        wt.setStyle(TableStyle([
+            ("BACKGROUND",    (0,0),  (-1,0),  CT),
+            ("TEXTCOLOR",     (0,0),  (-1,0),  rc.white),
+            ("FONTNAME",      (0,0),  (-1,0),  "Helvetica-Bold"),
+            ("BACKGROUND",    (0,-1), (-1,-1), CT),
+            ("TEXTCOLOR",     (0,-1), (-1,-1), rc.white),
+            ("FONTNAME",      (0,-1), (-1,-1), "Helvetica-Bold"),
+            ("ALIGN",         (0,0),  (-1,-1), "CENTER"),
+            ("FONTSIZE",      (0,0),  (-1,-1), 8.5),
+            ("TOPPADDING",    (0,0),  (-1,-1), 4),
+            ("BOTTOMPADDING", (0,0),  (-1,-1), 4),
+            ("GRID",          (0,0),  (-1,-1), 0.3, CMG),
+            ("ROWBACKGROUNDS",(0,1),  (-1,-2), [CLG, rc.white]),
+        ]))
+        story.append(wt)
+
+    # ── Page 2: Dealer Breakdown ─────────────────────────────────────────────────
+    active_bkdn = [(n, s) for n, s in g_bkdn if s is not None]
+    if active_bkdn:
+        story.append(PageBreak())
+        story.append(header_tbl())
+        story.append(Spacer(1, 6))
+        story.append(Paragraph(f"<b>{group_name}</b>",
+                               ps("gn2", fontSize=16, fontName="Helvetica-Bold")))
+        story.append(Paragraph("Dealer Breakdown",
+                               ps("bkdn_sub", fontSize=10, fontName="Helvetica-Bold",
+                                  textColor=CDT, spaceAfter=6)))
+
+        hdr_row = [
+            Paragraph("<b>Dealer</b>",         ps("bh0", fontSize=8, fontName="Helvetica-Bold", textColor=rc.white)),
+            Paragraph("<b>Logins</b>",          ps("bh1", fontSize=8, fontName="Helvetica-Bold", textColor=rc.white, alignment=TA_CENTER)),
+            Paragraph("<b>Apps</b>",            ps("bh2", fontSize=8, fontName="Helvetica-Bold", textColor=rc.white, alignment=TA_CENTER)),
+            Paragraph("<b>Approved</b>",        ps("bh3", fontSize=8, fontName="Helvetica-Bold", textColor=rc.white, alignment=TA_CENTER)),
+            Paragraph("<b>Appr. Rate</b>",      ps("bh4", fontSize=8, fontName="Helvetica-Bold", textColor=rc.white, alignment=TA_CENTER)),
+            Paragraph("<b>Funded</b>",          ps("bh5", fontSize=8, fontName="Helvetica-Bold", textColor=rc.white, alignment=TA_CENTER)),
+            Paragraph("<b>L2B</b>",             ps("bh6", fontSize=8, fontName="Helvetica-Bold", textColor=rc.white, alignment=TA_CENTER)),
+            Paragraph("<b>Total Reserve</b>",   ps("bh7", fontSize=8, fontName="Helvetica-Bold", textColor=rc.white, alignment=TA_RIGHT)),
+            Paragraph("<b>Avg Back End</b>",    ps("bh8", fontSize=8, fontName="Helvetica-Bold", textColor=rc.white, alignment=TA_RIGHT)),
+        ]
+        bkdn_data = [hdr_row]
+        for dname, ds in active_bkdn:
+            bkdn_data.append([
+                Paragraph(dname, ps(f"bd{dname[:4]}", fontSize=8)),
+                Paragraph(_n(ds["logins"]),       ps("bc1", fontSize=8, alignment=TA_CENTER)),
+                Paragraph(_n(ds["ffs"]),           ps("bc2", fontSize=8, alignment=TA_CENTER)),
+                Paragraph(_n(ds["gr"]),            ps("bc3", fontSize=8, alignment=TA_CENTER)),
+                Paragraph(_p(ds["approval_rate"]), ps("bc4", fontSize=8, alignment=TA_CENTER)),
+                Paragraph(_n(ds["ric"]),           ps("bc5", fontSize=8, alignment=TA_CENTER)),
+                Paragraph(_p(ds["l2b"]),           ps("bc6", fontSize=8, alignment=TA_CENTER)),
+                Paragraph(_d(ds["total_reserve"]), ps("bc7", fontSize=8, alignment=TA_RIGHT)),
+                Paragraph(_d(ds["avg_be"]),        ps("bc8", fontSize=8, alignment=TA_RIGHT)),
+            ])
+        bkdn_tbl = Table(bkdn_data,
+                         colWidths=[2.0*inch, .55*inch, .55*inch, .65*inch, .65*inch, .55*inch, .55*inch, .85*inch, .85*inch])
+        bkdn_tbl.setStyle(TableStyle([
+            ("BACKGROUND",    (0,0),  (-1,0),  CT),
+            ("TEXTCOLOR",     (0,0),  (-1,0),  rc.white),
+            ("FONTNAME",      (0,0),  (-1,0),  "Helvetica-Bold"),
+            ("ALIGN",         (1,0),  (-1,-1), "CENTER"),
+            ("ALIGN",         (7,0),  (-1,-1), "RIGHT"),
+            ("FONTSIZE",      (0,0),  (-1,-1), 8),
+            ("TOPPADDING",    (0,0),  (-1,-1), 4),
+            ("BOTTOMPADDING", (0,0),  (-1,-1), 4),
+            ("LEFTPADDING",   (0,0),  (-1,-1), 4),
+            ("RIGHTPADDING",  (0,0),  (-1,-1), 4),
+            ("GRID",          (0,0),  (-1,-1), 0.3, CMG),
+            ("ROWBACKGROUNDS",(0,1),  (-1,-1), [CLG, rc.white]),
+        ]))
+        story.append(bkdn_tbl)
+
+    story.append(Spacer(1, 10))
+    story.append(Paragraph(
+        f"Generated {_dt.now().strftime('%B %d, %Y')}  ·  Confidential — For internal use only  ·  Upstart Auto Retail",
+        ps("foot", fontSize=7.5, textColor=rc.HexColor("#AAAAAA"), alignment=TA_CENTER)
+    ))
+    doc.build(story)
+    buf.seek(0)
+    return buf.getvalue()
+
+
 # ── Metric box helpers ────────────────────────────────────────────────────────
 TIER_M = {
     "good":    {"bg":"#e8f8f7", "border":TEAL,  "hdr":DTEAL, "label":"✓ Above Network Average"},
@@ -1600,6 +1903,94 @@ if view == "Group":
         st.info("No activity data found for this group in the selected period.")
         st.stop()
 
+    _ins_title, _ins_sub, _ins_body = group_performance_insight(gp, g_bench)
+
+    # ── Action buttons ───────────────────────────────────────────────────────
+    _gbtn1, _gbtn2, _gspacer = st.columns([1.1, 1.8, 5], gap="small")
+
+    with _gbtn1:
+        _g_print_clicked = st.button("🖨️  Print to PDF", use_container_width=True, key="g_print_btn")
+
+    with _gbtn2:
+        with st.popover("📧  Send Report", use_container_width=True):
+            st.markdown(f"**Email group report — {_html.escape(sel_group)}**")
+
+            _g_to_email = st.text_input("Recipient email address",
+                                        placeholder="contact@grouphq.com",
+                                        label_visibility="collapsed",
+                                        key="g_email_input")
+
+            st.markdown("<div style='font-size:12px;color:#555;margin:8px 0 3px;font-weight:600;'>"
+                        "Personal message (optional)</div>", unsafe_allow_html=True)
+            _g_personal_msg = st.text_area(
+                "g_personal_msg",
+                placeholder="e.g. Here's your group performance report for the period. "
+                            "Let me know if you'd like to connect to review.",
+                label_visibility="collapsed",
+                height=90,
+                key="g_personal_msg_input",
+            )
+
+            _g_drm_info  = DRM_CONTACTS.get(g_dsm, {})
+            _g_drm_phone = _g_drm_info.get("phone", "")
+            _g_drm_email = _g_drm_info.get("email", "")
+            st.markdown(f"""
+            <div style="background:#f5f5f5;border-left:3px solid {TEAL};
+                        padding:8px 12px;border-radius:0 4px 4px 0;
+                        font-size:11.5px;color:#444;margin:8px 0 10px;line-height:1.7;">
+              <b>{_html.escape(g_dsm)}</b><br>
+              Dealer Relationship Manager · Upstart Auto Retail<br>
+              {_g_drm_phone}{' · ' if _g_drm_phone and _g_drm_email else ''}
+              <span style="color:{TEAL};">{_g_drm_email}</span>
+            </div>
+            """, unsafe_allow_html=True)
+
+            _g_send_clicked = st.button("Send Report", type="primary",
+                                        use_container_width=True, key="g_send_btn",
+                                        disabled=not bool(_g_to_email.strip()))
+
+            if _g_send_clicked and _g_to_email.strip():
+                with st.spinner("Generating PDF and sending email…"):
+                    try:
+                        _g_pdf_bytes = generate_group_pdf(
+                            sel_group, g_dsm, period_str, gp, g_bench, g_rank,
+                            total_grps, _ins_sub, _ins_body, g_wkly, g_bkdn,
+                        )
+                        _g_subject = f"Group Performance Report — {sel_group} — {period_str}"
+                        _g_personal_block = f"{_g_personal_msg.strip()}\n\n" if _g_personal_msg.strip() else ""
+                        _g_body = (
+                            f"Hi,\n\n"
+                            f"{_g_personal_block}"
+                            f"Please find the Upstart Group Performance Report attached for {period_str}.\n\n"
+                            f"Group Highlights:\n"
+                            f"  • Funded Loans:   {_n(gp['fl'])}  (group median {_n(g_bench.get('fl'))})\n"
+                            f"  • Look to Book:   {_p(gp['l2b'])}  (group median {_p(g_bench.get('l2b'))})\n"
+                            f"  • Approval Rate:  {_p(gp['approval_rate'])}  (group median {_p(g_bench.get('approval_rate'))})\n"
+                            f"  • Total Reserve:  {_d(gp['total_reserve'])}  (group median {_d(g_bench.get('total_reserve'))})\n"
+                            f"  • Avg Back End:   {_d(gp['avg_be'])}  (group median {_d(g_bench.get('avg_be'))})\n\n"
+                            f"Feel free to reach out anytime.\n\n"
+                            f"--\n"
+                            f"{g_dsm}\n"
+                            f"Dealer Relationship Manager · Upstart Auto Retail\n"
+                            f"{_g_drm_phone}{' · ' if _g_drm_phone and _g_drm_email else ''}{_g_drm_email}"
+                        )
+                        send_report_email(
+                            _g_to_email.strip(), sel_group, g_dsm, _g_drm_email,
+                            period_str, _g_pdf_bytes, _g_subject, _g_body,
+                        )
+                        st.success(f"✅ Report sent to {_g_to_email.strip()}")
+                    except Exception as _ge:
+                        err = str(_ge)
+                        if "insufficient" in err.lower() or "scope" in err.lower() or "forbidden" in err.lower():
+                            st.error("Gmail permission not yet granted. Run `python3 'setup_gmail_auth.py'` then try again.")
+                        else:
+                            st.error(f"Send failed: {err}")
+
+    if _g_print_clicked:
+        components.html("<script>window.parent.print();</script>", height=0)
+
+    st.markdown("---")
+
     # ── Rankings ─────────────────────────────────────────────────────────────
     def _grp_rank_badge(label, rank_key):
         rank = g_rank.get(rank_key)
@@ -1620,7 +2011,6 @@ if view == "Group":
     )
 
     # ── Performance insight ───────────────────────────────────────────────────
-    _ins_title, _ins_sub, _ins_body = group_performance_insight(gp, g_bench)
     st.markdown(f"""
 <div style="display:flex;align-items:stretch;margin-bottom:18px;gap:0;
             border:1px solid #e0e0e0;border-radius:6px;overflow:hidden;">
