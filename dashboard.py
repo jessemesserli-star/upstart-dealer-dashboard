@@ -1263,7 +1263,7 @@ def generate_group_pdf(group_name, g_dsm, period_str, gp, g_bench, g_rank,
 
     story.append(Paragraph(f"<b>{group_name}</b>", ps("gn", fontSize=16, fontName="Helvetica-Bold")))
     story.append(Paragraph(
-        f"<font color='#555555'>DSM: <b>{g_dsm}</b></font>",
+        f"<font color='#555555'>{len(g_bkdn)} dealer location{'s' if len(g_bkdn) != 1 else ''}</font>",
         ps("dsm")
     ))
     story.append(Spacer(1, 8))
@@ -1894,8 +1894,7 @@ if view == "Group":
   <span style="font-size:22px;font-weight:800;color:#111;">{_html.escape(sel_group)}</span>
 </div>
 <div style="font-size:13px;color:#555;margin-bottom:8px;">
-  DSM: <b>{_html.escape(g_dsm)}</b>
-  &nbsp;·&nbsp; {len(g_dealer_ids)} dealer location{'s' if len(g_dealer_ids) != 1 else ''}
+  {len(g_dealer_ids)} dealer location{'s' if len(g_dealer_ids) != 1 else ''}
 </div>
 """, unsafe_allow_html=True)
 
