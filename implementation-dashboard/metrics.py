@@ -106,12 +106,12 @@ def compute(read_range, today=None):
     cw_start = this_monday; cw_end = this_monday + datetime.timedelta(days=6)
     def proj_cw():
         ab = c = 0
-        for r in impl:
+        for r in impl:   # in-pipeline (not yet launched): projected this week OR overdue (projected on/before CW end)
             d = pdate(r.get("Projected Launch Date"))
-            if d and cw_start <= d <= cw_end:
+            if d and d <= cw_end:
                 if grade_group(r.get("Account Grade")) == "A & B": ab += 1
                 else: c += 1
-        for r in launch:
+        for r in launch:   # already launched this week
             d = pdate(r.get(LC))
             if d and cw_start <= d <= cw_end:
                 if grade_group(r.get("Account Grade")) == "A & B": ab += 1
