@@ -133,7 +133,7 @@ with right:
     st.markdown(f"<div style='background:{TEAL_D};color:#E6F6F2;text-align:center;font-weight:600;"
                 f"padding:6px;border-radius:8px;text-transform:uppercase;'>Current Quarter</div>", unsafe_allow_html=True)
     a, b, cc = st.columns(3)
-    with a: kpi("New Imp", m["cq_new"], "&nbsp;")
+    with a: kpi("Closed Won CQ", m["cq_new"], "&nbsp;")
     with b: kpi("Launch Ready", m["cq_count"], "&nbsp;")
     with cc: kpi("Med Days to LR", num(m["cq_med"]), "&nbsp;")
     tw, pw = m["tw"], m["pw"]
