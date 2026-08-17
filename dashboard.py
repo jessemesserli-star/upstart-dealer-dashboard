@@ -2487,56 +2487,6 @@ else:
 st.markdown("---")
 
 
-# ── UPSTART OPPORTUNITIES ──────────────────────────────────────────────────────
-st.markdown(f"<div style='color:{DTEAL};font-size:13px;font-weight:700;margin-bottom:4px;'>"
-            f"Upstart Opportunities — Deals In Our Wheelhouse</div>", unsafe_allow_html=True)
-st.caption("Credit apps from this period matching Upstart's buy box (FICO 620–740, APR <20%, vehicle 5–10 years old).")
-
-opp_start = pd.Timestamp(sel_weeks[0])
-opp_end   = pd.Timestamp(sel_weeks[-1]) + pd.Timedelta(days=6)
-opp_df    = get_opportunities(credit_apps, sel_dealer, opp_start, opp_end)
-
-if opp_df.empty:
-    st.markdown("<div style='color:#666;font-size:13px;font-style:italic;'>"
-                "No opportunities matching Upstart's buy box found for this period.</div>",
-                unsafe_allow_html=True)
-else:
-    # Build HTML table with clickable View Deal links (matching PDF format)
-    opp_rows = ""
-    for i, row in opp_df.iterrows():
-        bg = "#F5F7FA" if i % 2 == 0 else "white"
-        link_cell = (f"<a href='{row['_link']}' target='_blank' "
-                     f"style='color:{TEAL};font-weight:600;text-decoration:none;'>View Deal</a>"
-                     if row["_link"] else "—")
-        opp_rows += (
-            f"<tr style='background:{bg};'>"
-            f"<td style='padding:6px 10px;'>{row['Date']}</td>"
-            f"<td style='padding:6px 10px;'>{_html.escape(str(row['Vehicle']))}</td>"
-            f"<td style='padding:6px 10px;text-align:center;'>{row['FICO']}</td>"
-            f"<td style='padding:6px 10px;text-align:center;'>{row['APR']}</td>"
-            f"<td style='padding:6px 10px;text-align:right;'>{row['Amount']}</td>"
-            f"<td style='padding:6px 10px;text-align:center;'>{link_cell}</td>"
-            f"</tr>"
-        )
-    st.markdown(f"""
-    <table style="width:100%;border-collapse:collapse;font-size:13px;margin-top:4px;">
-      <thead>
-        <tr style="background:{TEAL};">
-          <th style="padding:7px 10px;text-align:left;color:white;font-weight:600;">Date</th>
-          <th style="padding:7px 10px;text-align:left;color:white;font-weight:600;">Vehicle</th>
-          <th style="padding:7px 10px;text-align:center;color:white;font-weight:600;">FICO</th>
-          <th style="padding:7px 10px;text-align:center;color:white;font-weight:600;">APR</th>
-          <th style="padding:7px 10px;text-align:right;color:white;font-weight:600;">Amount</th>
-          <th style="padding:7px 10px;text-align:center;color:white;font-weight:600;">Link</th>
-        </tr>
-      </thead>
-      <tbody>{opp_rows}</tbody>
-    </table>
-    """, unsafe_allow_html=True)
-
-st.markdown("---")
-
-
 # ── PORTFOLIO HEALTH ───────────────────────────────────────────────────────────
 # Banner — description text fills the space inside the header, no blank gap
 st.markdown(f"""
