@@ -107,6 +107,7 @@ def compute(read_range, today=None):
     def proj_cw():
         ab = c = 0
         for r in impl:   # in-pipeline (not yet launched): projected this week OR overdue (projected on/before CW end)
+            if str(r.get("Implementation Status", "")).strip() in BLOCKED_STATUSES: continue  # exclude blocked
             d = pdate(r.get("Projected Launch Date"))
             if d and d <= cw_end:
                 if grade_group(r.get("Account Grade")) == "A & B": ab += 1
