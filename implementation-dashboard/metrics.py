@@ -101,6 +101,24 @@ def compute(read_range, today=None):
         return {"ab": ab, "c": c, "total": tot, "med": med}
     tw = lr_window(tw_start, tw_end); pw = lr_window(pw_start, pw_end)
 
+    # projected launches this (current) calendar week, by grade:
+    # in-pipeline accounts with Projected Launch Date in the current week + accounts already launched this week
+    cw_start = this_monday; cw_end = this_monday + datetime.timedelta(days=6)
+    def proj_cw():
+        ab = c = 0
+        for r in impl:
+            d = pdate(r.get("Projected Launch Date"))
+            if d and cw_start <= d <= cw_end:
+                if grade_group(r.get("Account Grade")) == "A & B": ab += 1
+                else: c += 1
+        for r in launch:
+            d = pdate(r.get(LC))
+            if d and cw_start <= d <= cw_end:
+                if grade_group(r.get("Account Grade")) == "A & B": ab += 1
+                else: c += 1
+        return {"ab": ab, "c": c, "total": ab + c}
+    proj = proj_cw()
+
     # current-quarter launch-ready accounts (user-maintained "CQ Launch Ready" tab)
     cq = rows_as_dicts(read_range("CQ Launch Ready!A1:Q1000"))
     cq_lr = [r for r in cq if pdate(r.get("Launch Ready Date"))]
@@ -151,4 +169,4 @@ def compute(read_range, today=None):
                 launches_qtd=launches_qtd, launches_prevq=launches_prevq, avg_30d=avg_30d, avg_prev30=avg_prev30,
                 tw=tw, pw=pw, tw_start=tw_start, tw_end=tw_end, pw_start=pw_start, prev=prev,
                 fwk_cur=fwk_cur, fwk_prev=fwk_prev, fw_start=fw_cur_start, fw_end=fw_cur_end,
-                cq_count=cq_count, cq_med=cq_med, cq_new=cq_new)
+                cq_count=cq_count, cq_med=cq_med, cq_new=cq_new, proj=proj)

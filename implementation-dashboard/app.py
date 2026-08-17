@@ -136,10 +136,11 @@ with right:
     with a: kpi("Closed Won CQ", m["cq_new"], "&nbsp;")
     with b: kpi("Launch Ready", m["cq_count"], "&nbsp;")
     with cc: kpi("Med Days to LR", num(m["cq_med"]), "&nbsp;")
-    tw, pw = m["tw"], m["pw"]
-    cols = [f"Week of {m['pw_start']:%-m/%-d}", f"Week of {m['tw_start']:%-m/%-d}"]
+    tw, pw, pr = m["tw"], m["pw"], m["proj"]
+    c0 = f"Week of {m['pw_start']:%-m/%-d}"; c1 = f"Week of {m['tw_start']:%-m/%-d}"; c2 = "Projected CW"
     grade = pd.DataFrame(
-        {cols[0]: [pw["ab"], pw["c"], pw["total"]], cols[1]: [tw["ab"], tw["c"], tw["total"]]},
+        {c0: [pw["ab"], pw["c"], pw["total"]], c1: [tw["ab"], tw["c"], tw["total"]],
+         c2: [pr["ab"], pr["c"], pr["total"]]},
         index=["A & B", "C & No Grade", "Total"])
     st.table(grade)
 
